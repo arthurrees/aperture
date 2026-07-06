@@ -22,6 +22,10 @@ windows-core = "0.61"
 # Brave's pure-Rust ad/tracker blocking engine (request matching against filter lists).
 adblock = "0.12"
 
+# Read Chrome's History database for the Chrome importer (bundled = no system SQLite needed;
+# compiles the C source with the same MinGW gcc the toolchain already requires).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # For the IStream type passed to CreateWebResourceResponse. Same windows 0.61 wry already uses;
 # this just enables the COM feature.
 windows = { version = "0.61", features = [

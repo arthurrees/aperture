@@ -527,6 +527,33 @@
                width: 100%; height: 34px; border-radius: 7px; cursor: pointer; font: inherit;
                transition: border-color .12s ease, color .12s ease; }
   .addrow button:hover { border-color: var(--accent); color: var(--fg); }
+
+  /* Profiles: card per identity, colored avatar from the name */
+  .prof-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; margin-bottom: 8px;
+               border: 1px solid var(--stroke); border-radius: 9px; background: var(--bg-elev); }
+  .prof-card.current { border-color: var(--accent); }
+  .prof-av { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 8px; display: grid;
+             place-items: center; font-size: 15px; font-weight: 600; color: #fff; }
+  .prof-meta { flex: 1 1 auto; min-width: 0; }
+  .prof-name { font-size: 13px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prof-sub { font-size: 11px; color: var(--fg-dim); margin-top: 1px; }
+  .prof-card .act { height: 30px; padding: 0 12px; flex: 0 0 auto; border-radius: 6px; cursor: pointer;
+               font: inherit; font-size: 12px; border: 1px solid var(--stroke); background: transparent;
+               color: var(--fg); }
+  .prof-card .act:hover { border-color: var(--accent); }
+  .prof-card .badge { font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+               color: var(--accent); flex: 0 0 auto; padding: 0 4px; }
+  .prof-card .del { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center;
+               border-radius: 6px; color: var(--fg-dim); cursor: pointer; border: 0; background: transparent; font-size: 17px; }
+  .prof-card .del:hover { background: #3a3f49; color: #e06c6c; }
+  .prof-card .del.arm { color: #e06c6c; font-size: 11px; width: auto; padding: 0 8px; }
+  .prof-create { display: flex; gap: 8px; margin-top: 10px; }
+  .prof-create input { flex: 1 1 auto; height: 34px; background: var(--bg); color: var(--fg); font: inherit;
+               border: 1px solid var(--stroke); border-radius: 7px; padding: 0 10px; outline: none; user-select: text; }
+  .prof-create input:focus { border-color: var(--accent); }
+  .prof-create button { flex: 0 0 auto; height: 34px; padding: 0 14px; border-radius: 7px; cursor: pointer;
+               font: inherit; border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+  .prof-create button:disabled { opacity: .5; cursor: default; }
   .prefs { display: flex; flex-direction: column; gap: 9px; margin-bottom: 16px; }
   .pref { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--fg-dim); }
   .pref > span { flex: 0 0 132px; }
@@ -758,6 +785,18 @@
                 <label class="pref"><span>Archive after</span><input id="setArchiveDays" type="number" min="1" max="365" step="1" /><em>days unused; find them under History (Ctrl+H) &gt; Archived</em></label>
               </div>
             </div>
+            <div id="chrome-import-section">
+              <div class="prefs-h">Import from Chrome</div>
+              <div class="addrow" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+                <select id="ciProfile" style="flex:0 0 170px"></select>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12px;cursor:pointer"><input id="ciBm" type="checkbox" checked />Bookmarks</label>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12px;cursor:pointer"><input id="ciHist" type="checkbox" checked />History</label>
+                <label style="display:flex;gap:5px;align-items:center;font-size:12px;cursor:pointer"><input id="ciExt" type="checkbox" />Extensions</label>
+                <button id="ciGo" type="button">Import</button>
+              </div>
+              <div id="ci-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px;min-height:14px"></div>
+              <div style="font-size:11px;color:var(--fg-dim);margin-top:2px">Passwords: export them in Chrome (Passwords &gt; Export) and import the CSV into Bitwarden; Aperture fills logins from your vault.</div>
+            </div>
             <div id="default-browser-section">
               <div class="prefs-h">Default browser</div>
               <div class="addrow"><button id="defbrowser" type="button">Make Aperture the default browser…</button></div>
@@ -849,13 +888,14 @@
           </section>
           <section id="sec-profiles">
             <div id="profiles-section">
-              <div class="prefs-h" style="border-top:0;padding-top:0">Profiles <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(each profile keeps its own logins, history, settings, and extensions; switching relaunches into it)</em></div>
+              <div class="prefs-h" style="border-top:0;padding-top:0">Profiles <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(each keeps its own logins, history, and settings; switching reopens Aperture as that profile)</em></div>
               <div id="profrows"></div>
-              <div class="addrow" style="display:flex;gap:8px">
-                <input id="profnew" type="text" placeholder="New profile name" autocomplete="off" style="flex:1 1 auto" />
-                <button id="profadd" type="button">+ Create and switch</button>
+              <div class="prof-create">
+                <input id="profnew" type="text" placeholder="New profile name" autocomplete="off" maxlength="40" />
+                <button id="profadd" type="button">Create</button>
               </div>
-              <label class="pref pref-toggle" style="margin-top:12px"><span>Ask which profile at every launch</span><input id="profask" type="checkbox" /></label>
+              <div id="prof-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px;min-height:14px"></div>
+              <label class="pref pref-toggle" style="margin-top:14px"><span>Ask which profile to open at launch</span><input id="profask" type="checkbox" /></label>
             </div>
           </section>
           <section id="sec-appearance">
@@ -1799,39 +1839,61 @@
   // Profiles: Chrome-style separate identities. The host relaunches into the picked profile.
   let profList = ['Default'], profCurrent = 'Default', profAsk = false;
   const profRows = document.getElementById('profrows');
+  // A stable color per name so an avatar is recognizable at a glance.
+  function profColor(name) {
+    let h = 0; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return 'hsl(' + (h % 360) + ' 52% 48%)';
+  }
+  function profInitial(name) { return (name.trim()[0] || '?').toUpperCase(); }
   function renderProfiles() {
     profRows.innerHTML = '';
     profList.forEach(name => {
-      const row = document.createElement('div'); row.className = 'lrow';
-      const lbl = document.createElement('span'); lbl.textContent = name; lbl.style.flex = '1 1 auto';
-      row.appendChild(lbl);
-      if (name === profCurrent) {
-        const cur = document.createElement('span'); cur.textContent = 'current';
-        cur.style.cssText = 'color:var(--fg-dim);font-size:11px';
-        row.appendChild(cur);
+      const isCur = name === profCurrent;
+      const card = document.createElement('div'); card.className = 'prof-card' + (isCur ? ' current' : '');
+      const av = document.createElement('div'); av.className = 'prof-av';
+      av.style.background = profColor(name); av.textContent = profInitial(name);
+      const meta = document.createElement('div'); meta.className = 'prof-meta';
+      const nm = document.createElement('div'); nm.className = 'prof-name'; nm.textContent = name;
+      const sub = document.createElement('div'); sub.className = 'prof-sub';
+      sub.textContent = isCur ? 'This profile' : (name === 'Default' ? 'Original profile' : 'Separate logins and history');
+      meta.append(nm, sub);
+      card.append(av, meta);
+      if (isCur) {
+        const b = document.createElement('span'); b.className = 'badge'; b.textContent = 'current';
+        card.appendChild(b);
       } else {
-        const sw = document.createElement('button'); sw.textContent = 'Switch';
+        const sw = document.createElement('button'); sw.className = 'act'; sw.textContent = 'Switch';
         sw.onclick = () => send({ cmd: 'profile_switch', name });
-        row.appendChild(sw);
-        if (name !== 'Default') {
-          // Deleting wipes that profile's logins/history, so require a second click.
-          const del = document.createElement('button'); del.className = 'del'; del.textContent = '×';
-          del.title = 'Delete profile (removes its logins, history, and settings)';
-          del.onclick = () => {
-            if (del.dataset.arm) { send({ cmd: 'profile_delete', name }); }
-            else { del.dataset.arm = '1'; del.textContent = 'Sure?'; setTimeout(() => { delete del.dataset.arm; del.textContent = '×'; }, 3000); }
-          };
-          row.appendChild(del);
-        }
+        card.appendChild(sw);
       }
-      profRows.appendChild(row);
+      if (name !== 'Default' && !isCur) {
+        // Deleting wipes that profile's logins/history, so require a second click.
+        const del = document.createElement('button'); del.className = 'del'; del.textContent = '×';
+        del.title = 'Delete profile (removes its logins, history, and settings)';
+        del.onclick = () => {
+          if (del.dataset.arm) { send({ cmd: 'profile_delete', name }); }
+          else { del.dataset.arm = '1'; del.classList.add('arm'); del.textContent = 'Delete?'; setTimeout(() => { delete del.dataset.arm; del.classList.remove('arm'); del.textContent = '×'; }, 3000); }
+        };
+        card.appendChild(del);
+      }
+      profRows.appendChild(card);
     });
     document.getElementById('profask').checked = profAsk;
   }
-  document.getElementById('profadd').onclick = () => {
-    const name = document.getElementById('profnew').value.trim();
-    if (name) send({ cmd: 'profile_create', name });
-  };
+  const profAddBtn = document.getElementById('profadd');
+  const profNewInput = document.getElementById('profnew');
+  function submitNewProfile() {
+    const name = profNewInput.value.trim();
+    const msg = document.getElementById('prof-msg');
+    if (!name) { msg.textContent = 'Enter a name first.'; return; }
+    if (name.toLowerCase() === 'default' || profList.some(p => p.toLowerCase() === name.toLowerCase())) {
+      msg.textContent = 'A profile with that name already exists.'; return;
+    }
+    msg.textContent = 'Creating and switching…';
+    send({ cmd: 'profile_create', name });
+  }
+  profAddBtn.onclick = submitNewProfile;
+  profNewInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitNewProfile(); } });
   document.getElementById('profask').addEventListener('change', (e) => {
     profAsk = e.target.checked;
     send({ cmd: 'profiles_ask', on: profAsk });
@@ -1840,6 +1902,31 @@
   const profPick = document.getElementById('profpick');
   function hideProfilePicker() { profPick.classList.remove('show'); setOverlay('ppick', false); }
   document.getElementById('profpickclose').onclick = hideProfilePicker;
+  // Import from Chrome: the host detects Chrome's profiles when Settings opens; Import runs on a
+  // host worker thread and reports back through importMsg.
+  let chromeProfiles = [];
+  const ciSel = document.getElementById('ciProfile');
+  function renderChromeProfiles() {
+    ciSel.innerHTML = '';
+    if (!chromeProfiles.length) {
+      const o = document.createElement('option'); o.textContent = 'Chrome not found'; ciSel.appendChild(o);
+      ciSel.disabled = true; document.getElementById('ciGo').disabled = true;
+      return;
+    }
+    ciSel.disabled = false; document.getElementById('ciGo').disabled = false;
+    chromeProfiles.forEach(p => {
+      const o = document.createElement('option'); o.value = p.dir; o.textContent = p.name; ciSel.appendChild(o);
+    });
+  }
+  document.getElementById('ciGo').onclick = () => {
+    if (!chromeProfiles.length) return;
+    const bm = document.getElementById('ciBm').checked;
+    const hist = document.getElementById('ciHist').checked;
+    const ext = document.getElementById('ciExt').checked;
+    if (!bm && !hist && !ext) { document.getElementById('ci-msg').textContent = 'Pick at least one thing to import.'; return; }
+    send({ cmd: 'chrome_import', profile: ciSel.value, bm, hist, ext });
+    document.getElementById('ci-msg').textContent = 'Importing…';
+  };
   // Default browser: the host registers Aperture in HKCU, then Windows Settings opens for the
   // user to pick it (Windows does not let apps switch the default themselves).
   document.getElementById('defbrowser').onclick = () => {
@@ -2313,6 +2400,8 @@
     showHistory(list)     { lastHistory = list || []; renderHistory(); },
     setArchive(list)      { lastArchive = list || []; if (histMode === 'a') renderHistory(); },
     setProfiles(list, current, ask) { profList = list || ['Default']; profCurrent = current || 'Default'; profAsk = !!ask; renderProfiles(); },
+    setChromeProfiles(list) { chromeProfiles = list || []; renderChromeProfiles(); },
+    importMsg(m)          { document.getElementById('ci-msg').textContent = m; },
     showProfilePicker() {
       const g = document.getElementById('profpicklist'); g.innerHTML = '';
       profList.forEach(name => {
@@ -2396,6 +2485,8 @@
       atcRows.innerHTML = '';
       (prefs.atc_rules || []).forEach(addAtcRow);
       document.getElementById('defbrowser-msg').textContent = '';
+      document.getElementById('prof-msg').textContent = '';
+      document.getElementById('ci-msg').textContent = '';
       // Shortcuts apply to the new-tab page; the full settings page always shows + saves them.
       linkRows.innerHTML = '';
       (links || []).forEach(addLinkRow);

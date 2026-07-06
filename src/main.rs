@@ -60,6 +60,7 @@ use wry::{
 mod ai;
 mod bitwarden;
 mod blocker;
+mod import;
 mod search;
 mod store;
 mod webauthn;
@@ -567,6 +568,15 @@ enum UserEvent {
     HardReload,
     /// A URL handed to Aperture from outside (default-browser open or a second launch).
     OpenExternal(String),
+    /// Run the Chrome importer on a worker thread (Settings > General > Import from Chrome).
+    ChromeImport { profile: String, bm: bool, hist: bool, ext: bool },
+    /// Importer results, merged into live state on the main thread.
+    ChromeImportDone {
+        bookmarks: Vec<store::Bookmark>,
+        folders: Vec<String>,
+        history: Vec<store::HistoryEntry>,
+        ext_notes: Vec<(String, String)>,
+    },
     /// Relaunch into another profile (this instance closes like a normal window close).
     SwitchProfile(String),
     /// Create a profile in the registry, then switch to it.
@@ -1229,6 +1239,16 @@ fn main() -> wry::Result<()> {
                 }
                 Some("set_default_browser") => {
                     let _ = proxy_ipc.send_event(UserEvent::SetDefaultBrowser);
+                }
+                Some("chrome_import") => {
+                    if let Some(p) = v["profile"].as_str() {
+                        let _ = proxy_ipc.send_event(UserEvent::ChromeImport {
+                            profile: p.to_string(),
+                            bm: v["bm"].as_bool().unwrap_or(false),
+                            hist: v["hist"].as_bool().unwrap_or(false),
+                            ext: v["ext"].as_bool().unwrap_or(false),
+                        });
+                    }
                 }
                 Some("profile_switch") => {
                     if let Some(n) = v["name"].as_str() {
@@ -2659,6 +2679,95 @@ fn main() -> wry::Result<()> {
                         "window.__chrome&&window.__chrome.defaultBrowserMsg({ok})"
                     ));
                 }
+                UserEvent::ChromeImport { profile, bm, hist, ext } => {
+                    match import::profile_dir(&profile) {
+                        Some(dir) => {
+                            let proxy = spawn_proxy.clone();
+                            let ext_dest = store::extensions_dir();
+                            std::thread::spawn(move || {
+                                let bms = if bm {
+                                    import::read_bookmarks(&dir)
+                                } else {
+                                    import::ImportedBookmarks { items: Vec::new(), folders: Vec::new() }
+                                };
+                                let h = if hist {
+                                    import::read_history(&dir, store::HISTORY_CAP)
+                                } else {
+                                    Vec::new()
+                                };
+                                let e = if ext {
+                                    import::copy_extensions(&dir, &ext_dest)
+                                } else {
+                                    Vec::new()
+                                };
+                                let _ = proxy.send_event(UserEvent::ChromeImportDone {
+                                    bookmarks: bms.items,
+                                    folders: bms.folders,
+                                    history: h,
+                                    ext_notes: e,
+                                });
+                            });
+                        }
+                        None => {
+                            let _ = chrome.evaluate_script(
+                                "window.__chrome&&window.__chrome.importMsg(\"Chrome profile not found.\")",
+                            );
+                        }
+                    }
+                }
+                UserEvent::ChromeImportDone { bookmarks: bm_in, folders, history: hist_in, ext_notes } => {
+                    let bm_total = bm_in.len();
+                    let mut bm_new = 0usize;
+                    for b in bm_in {
+                        if !bookmarks.iter().any(|x| x.url == b.url) {
+                            bookmarks.push(b);
+                            bm_new += 1;
+                        }
+                    }
+                    for f in folders {
+                        if !settings.bookmark_folders.contains(&f) {
+                            settings.bookmark_folders.push(f);
+                        }
+                    }
+                    let hist_total = hist_in.len();
+                    let mut hist_new = 0usize;
+                    for h in hist_in {
+                        if !history.iter().any(|x| x.url == h.url) {
+                            history.push(h);
+                            hist_new += 1;
+                        }
+                    }
+                    history.truncate(store::HISTORY_CAP);
+                    if bm_new > 0 {
+                        store::save_bookmarks(&bookmarks);
+                        store::save_settings(&settings);
+                        push_bookmarks(&chrome, &bookmarks);
+                        push_bookmark_folders(&chrome, &settings.bookmark_folders);
+                        push_star(&chrome, &tabs, active, &bookmarks);
+                    }
+                    if hist_new > 0 {
+                        store::save_history(&history);
+                        push_history_source(&chrome, &history);
+                    }
+                    let mut msg = String::new();
+                    if bm_total > 0 || bm_new > 0 {
+                        msg += &format!("Bookmarks: {bm_new} new of {bm_total}. ");
+                    }
+                    if hist_total > 0 {
+                        msg += &format!("History: {hist_new} new of {hist_total}. ");
+                    }
+                    for (n, note) in &ext_notes {
+                        msg += &format!("{n}: {note}. ");
+                    }
+                    if msg.is_empty() {
+                        msg = "Nothing found to import.".to_string();
+                    }
+                    if let Ok(js) = serde_json::to_string(msg.trim()) {
+                        let _ = chrome.evaluate_script(&format!(
+                            "window.__chrome&&window.__chrome.importMsg({js})"
+                        ));
+                    }
+                }
                 UserEvent::SwitchProfile(name) => {
                     let valid = name == "Default" || profiles.list.contains(&name);
                     if valid && name != current_profile {
@@ -3754,6 +3863,16 @@ fn main() -> wry::Result<()> {
                         &window, &chrome, &ai_sidebar, &tabs, active, &links_json, &prefs_json,
                         is_home,
                     );
+                    // Detected Chrome profiles feed the Import-from-Chrome picker.
+                    let profs: Vec<serde_json::Value> = import::detect_profiles()
+                        .iter()
+                        .map(|p| serde_json::json!({ "dir": p.dir, "name": p.name }))
+                        .collect();
+                    if let Ok(js) = serde_json::to_string(&profs) {
+                        let _ = chrome.evaluate_script(&format!(
+                            "window.__chrome&&window.__chrome.setChromeProfiles({js})"
+                        ));
+                    }
                     // Fetch the installed Ollama models (off-thread) to populate the model dropdown.
                     if settings.ai.enabled {
                         let host = settings.ai.host.clone();
@@ -6375,6 +6494,7 @@ mod tests {
         let bookmarks = vec![store::Bookmark {
             title: "GitHub".into(),
             url: "https://github.com".into(),
+            folder: None,
         }];
         assert_eq!(
             best_completion(&history, &bookmarks, "ma"),

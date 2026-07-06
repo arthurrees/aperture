@@ -213,6 +213,7 @@ pub fn clear_closed_session() {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug)]
 pub struct Bookmark {
     pub title: String,
     pub url: String,
@@ -616,9 +617,10 @@ pub fn save_zoom(zoom: &HashMap<String, f64>) {
     }
 }
 
-const HISTORY_CAP: usize = 1000;
+pub const HISTORY_CAP: usize = 1000;
 
 #[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug)]
 pub struct HistoryEntry {
     pub url: String,
     pub title: String,

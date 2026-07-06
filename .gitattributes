@@ -1,0 +1,8 @@
+# Normalize line endings in the repo; check out as-is so Windows-only files stay stable.
+* text=auto
+*.rs text
+*.html text
+*.md text
+*.toml text
+*.rc text
+*.ico binary

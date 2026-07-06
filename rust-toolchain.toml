@@ -1,0 +1,4 @@
+# Aperture builds on the GNU toolchain on purpose: it avoids needing MSVC / Visual Studio.
+# rustup will install this toolchain automatically on first build.
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"

@@ -1,0 +1,64 @@
+! Bundled starter ad/tracker blocklist (Adblock Plus syntax), parsed by Brave's adblock engine.
+! This is a curated set of the most common ad/analytics/tracking domains so the mechanism is proven
+! out of the box. The real product should also load full EasyList/EasyPrivacy (fetched + cached);
+! see PLAN.md. Comments start with '!'.
+
+! --- Google ads / analytics / tags ---
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||google-analytics.com^
+||googletagmanager.com^
+||googletagservices.com^
+||adservice.google.com^
+||pagead2.googlesyndication.com^
+||securepubads.g.doubleclick.net^
+
+! --- Other big ad exchanges / SSPs ---
+||adnxs.com^
+||rubiconproject.com^
+||pubmatic.com^
+||openx.net^
+||criteo.com^
+||criteo.net^
+||casalemedia.com^
+||33across.com^
+||adsrvr.org^
+||amazon-adsystem.com^
+||moatads.com^
+||3lift.com^
+||sharethrough.com^
+
+! --- Social trackers ---
+||connect.facebook.net^
+||facebook.net^
+||analytics.tiktok.com^
+||ads-twitter.com^
+||analytics.twitter.com^
+
+! --- Analytics / measurement ---
+||scorecardresearch.com^
+||quantserve.com^
+||quantcount.com^
+||hotjar.com^
+||mixpanel.com^
+||segment.com^
+||segment.io^
+||fullstory.com^
+||mouseflow.com^
+||newrelic.com^
+||nr-data.net^
+||bugsnag.com^
+||sentry.io^
+
+! --- Content recommendation / native ads ---
+||taboola.com^
+||outbrain.com^
+||revcontent.com^
+
+! --- Misc trackers / beacons ---
+||branch.io^
+||bat.bing.com^
+||clarity.ms^
+||cdn.amplitude.com^
+||doubleverify.com^

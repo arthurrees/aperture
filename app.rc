@@ -1,0 +1,3 @@
+// Windows resource script. Icon ID 1 (lowest) becomes the .exe / Explorer / taskbar icon, and is
+// loaded at runtime as the window icon via Icon::from_resource(1, ..). See assets/icon.ico.
+1 ICON "assets/icon.ico"

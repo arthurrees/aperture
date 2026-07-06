@@ -1,0 +1,271 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root{
+    --bg:#0d0f13; --elev:#14171c; --elev2:#181c22; --stroke:#232830;
+    --fg:#d2d7df; --dim:#7f8893; --accent:#5b9cff; --accent-dim:#2b3550;
+    --user:#1a2332; --code:#0a0c0f;
+  }
+  html{color-scheme:dark;}
+  *{box-sizing:border-box;}
+  body{margin:0;height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);
+    font:14px/1.6 'Segoe UI',-apple-system,sans-serif;overflow:hidden;}
+
+  /* header */
+  .head{display:flex;align-items:center;gap:9px;padding:11px 13px;border-bottom:1px solid var(--stroke);
+    flex:0 0 auto;}
+  .head .lens{width:18px;height:18px;flex:0 0 auto;color:var(--accent);}
+  .head .ttl{font-weight:600;font-size:13px;letter-spacing:.2px;}
+  .head .model{font-size:11px;color:var(--dim);margin-left:2px;}
+  .head .sp{flex:1;}
+  .iconbtn{width:28px;height:28px;display:grid;place-items:center;border:0;background:transparent;
+    color:var(--dim);border-radius:6px;cursor:pointer;}
+  .iconbtn:hover{background:var(--elev2);color:var(--fg);}
+  .iconbtn svg{width:16px;height:16px;}
+
+  /* transcript */
+  .scroll{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:14px 13px 6px;}
+  .scroll::-webkit-scrollbar{width:9px;}
+  .scroll::-webkit-scrollbar-thumb{background:#2a313b;border-radius:5px;}
+
+  .msg{margin:0 0 14px;animation:fade .18s ease;}
+  @keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:none;}}
+  .msg .who{font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;
+    margin-bottom:4px;}
+  .msg.user .bubble{background:var(--user);border:1px solid var(--accent-dim);border-radius:9px;
+    padding:8px 11px;white-space:pre-wrap;word-break:break-word;}
+  .msg.ai .bubble{white-space:pre-wrap;word-break:break-word;}
+  .msg.ai .bubble code{background:var(--code);border:1px solid var(--stroke);border-radius:4px;
+    padding:1px 5px;font:12.5px ui-monospace,Consolas,monospace;}
+  .msg.err .bubble{color:#ff8f8f;background:#241619;border:1px solid #5a2b2b;border-radius:9px;padding:8px 11px;}
+  .ai-note{color:var(--dim);font-style:italic;font-size:12.5px;margin:1px 0 3px;}
+  .ai-src{margin-top:10px;padding-top:8px;border-top:1px solid var(--stroke);display:flex;flex-direction:column;gap:5px;}
+  .ai-src-h{font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;}
+  .ai-srcchip{color:var(--accent);font-size:12.5px;text-decoration:none;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .ai-srcchip:hover{text-decoration:underline;}
+  .cursor{display:inline-block;width:7px;height:15px;background:var(--accent);vertical-align:-2px;
+    margin-left:1px;animation:blink 1s steps(2) infinite;border-radius:1px;}
+  @keyframes blink{50%{opacity:0;}}
+
+  /* empty state */
+  .empty{padding:22px 6px;color:var(--dim);}
+  .empty h2{color:var(--fg);font-size:15px;margin:0 0 6px;font-weight:600;}
+  .empty p{margin:0 0 16px;font-size:13px;}
+  .quick{display:flex;flex-direction:column;gap:7px;}
+  .quick button{text-align:left;background:var(--elev);border:1px solid var(--stroke);color:var(--fg);
+    border-radius:8px;padding:9px 11px;cursor:pointer;font:13px 'Segoe UI',sans-serif;transition:.12s;}
+  .quick button:hover{border-color:var(--accent-dim);background:var(--elev2);}
+  .quick button .k{display:block;font-size:11px;color:var(--dim);margin-top:2px;}
+
+  /* composer */
+  .composer{flex:0 0 auto;border-top:1px solid var(--stroke);padding:9px 11px 11px;}
+  .scoperow{display:flex;align-items:center;gap:6px;margin-bottom:7px;}
+  .scope{display:flex;gap:3px;background:var(--elev);border:1px solid var(--stroke);border-radius:7px;padding:2px;}
+  .scope button{border:0;background:transparent;color:var(--dim);font:11px 'Segoe UI',sans-serif;
+    padding:3px 8px;border-radius:5px;cursor:pointer;}
+  .scope button.on{background:var(--accent-dim);color:#fff;}
+  .scoperow .note{font-size:10.5px;color:var(--dim);margin-left:auto;}
+  .inwrap{display:flex;align-items:flex-end;gap:7px;background:var(--elev);border:1px solid var(--stroke);
+    border-radius:10px;padding:7px 8px 7px 11px;}
+  .inwrap:focus-within{border-color:var(--accent-dim);}
+  textarea{flex:1;resize:none;border:0;outline:0;background:transparent;color:var(--fg);
+    font:14px/1.5 'Segoe UI',sans-serif;max-height:140px;}
+  textarea::placeholder{color:var(--dim);}
+  .send{width:32px;height:32px;flex:0 0 auto;border:0;border-radius:8px;background:var(--accent);
+    color:#0a0c0f;display:grid;place-items:center;cursor:pointer;}
+  .send:disabled{background:#2a313b;color:var(--dim);cursor:default;}
+  .send svg{width:16px;height:16px;}
+  .send.stop{background:#3a2330;color:#ff9f9f;}
+  .foot{font-size:10px;color:var(--dim);text-align:center;margin-top:7px;}
+</style>
+</head>
+<body>
+  <div class="head">
+    <svg class="lens" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v9l6.5 3.8"/><path d="M12 12 3.5 7.5"/><path d="M12 12l1.5 9"/></svg>
+    <span class="ttl">Aperture AI</span>
+    <span class="model" id="model"></span>
+    <span class="sp"></span>
+    <button class="iconbtn" id="newchat" title="New chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg></button>
+    <button class="iconbtn" id="close" title="Close (Alt+G)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+  </div>
+
+  <div class="scroll" id="scroll">
+    <div class="empty" id="empty">
+      <h2>Ask about this page</h2>
+      <div class="quick">
+        <button data-q="Summarize this page in a few sentences.">Summarize this page</button>
+        <button data-q="What are the key points on this page? Use a short bullet list.">Key points</button>
+        <button data-q="Explain this page in simple terms.">Explain simply</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="composer">
+    <div class="scoperow">
+      <div class="scope" id="scope">
+        <button data-scope="page" class="on" title="Answer using the current page">Page</button>
+        <button data-scope="web" title="Search the web and answer with sources">Web</button>
+        <button data-scope="general" title="Just chat, no page context">General</button>
+      </div>
+      <button class="iconbtn shot" id="shot" title="Screenshot the page for the AI (slower, use if it can't read the page properly)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L8 6H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-4z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
+    </div>
+    <div class="inwrap">
+      <textarea id="input" rows="1" placeholder="Ask anything…"></textarea>
+      <button class="send" id="send" disabled title="Send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+  </div>
+
+<script>
+(function(){
+  var scroll=document.getElementById('scroll'),empty=document.getElementById('empty'),
+      input=document.getElementById('input'),send=document.getElementById('send'),
+      scopeWrap=document.getElementById('scope');
+  var scope='page', streaming=false, curBubble=null, curCursor=null;
+
+  function post(o){ try{ window.ipc.postMessage(JSON.stringify(o)); }catch(e){} }
+  function atBottom(){ return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }
+  function toBottom(){ scroll.scrollTop = scroll.scrollHeight; }
+
+  function addMsg(cls, who, text){
+    if(empty) empty.style.display='none';
+    var m=document.createElement('div'); m.className='msg '+cls;
+    var w=document.createElement('div'); w.className='who'; w.textContent=who; m.appendChild(w);
+    var b=document.createElement('div'); b.className='bubble'; b.textContent=text||''; m.appendChild(b);
+    scroll.appendChild(m); toBottom();
+    return b;
+  }
+
+  function setStreaming(on){
+    streaming=on;
+    send.classList.toggle('stop',on);
+    send.disabled = on ? false : !input.value.trim();
+    send.title = on ? 'Stop' : 'Send';
+    send.innerHTML = on
+      ? '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>';
+  }
+
+  function ask(text, scopeOverride){
+    var sc = scopeOverride || scope;
+    if(streaming) return;
+    var t = (text||'').trim();
+    if(!t && sc !== 'vision') return; // vision can run with no question; text scopes need one
+    addMsg('user','You', t || (sc==='vision' ? '📷 Screenshot of this page' : ''));
+    var b=addMsg('ai','Aperture',''); curBubble=b;
+    curCursor=document.createElement('span'); curCursor.className='cursor'; b.appendChild(curCursor);
+    setStreaming(true);
+    post({cmd:'ai_ask', scope:sc, prompt:t});
+    input.value=''; resize();
+  }
+
+  function resize(){ input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,140)+'px';
+    if(!streaming) send.disabled=!input.value.trim(); }
+
+  // --- host -> sidebar API ---
+  window.__ai = {
+    focus:function(){ input.focus(); },
+    setModel:function(name){ document.getElementById('model').textContent='· '+name; },
+    // Host pushes which features are enabled; hide the controls for the off ones.
+    config:function(cfg){
+      cfg=cfg||{};
+      var webBtn=scopeWrap.querySelector('button[data-scope="web"]');
+      if(webBtn) webBtn.style.display=(cfg.web===false)?'none':'';
+      var shot=document.getElementById('shot');
+      if(shot) shot.style.display=(cfg.vision===false)?'none':'';
+      // If the selected scope was just hidden, fall back to Page.
+      if(cfg.web===false && scope==='web'){
+        scope='page';
+        Array.prototype.slice.call(scopeWrap.children).forEach(function(x){x.classList.toggle('on',x.dataset.scope==='page');});
+      }
+    },
+    // Host-initiated request (omnibox "?" question, or a selection-pill action): show the user's
+    // line and open a fresh assistant bubble, then tokens stream in via token()/done().
+    startExternal:function(userText){
+      if(streaming){ post({cmd:'ai_stop'}); }
+      if(empty) empty.style.display='none';
+      addMsg('user','You', userText||'');
+      var b=addMsg('ai','Aperture',''); curBubble=b;
+      curCursor=document.createElement('span'); curCursor.className='cursor'; b.appendChild(curCursor);
+      setStreaming(true);
+    },
+    token:function(delta){
+      if(!curBubble) return;
+      var stick=atBottom();
+      if(curCursor) curCursor.remove();
+      curBubble.appendChild(document.createTextNode(delta));
+      if(curCursor) curBubble.appendChild(curCursor);
+      if(stick) toBottom();
+    },
+    // Progress line for web search (Searching… / Reading source N… / Answering…).
+    note:function(text){
+      if(!curBubble) return;
+      var stick=atBottom();
+      var n=document.createElement('div'); n.className='ai-note'; n.textContent=text;
+      if(curCursor) curBubble.insertBefore(n,curCursor); else curBubble.appendChild(n);
+      if(stick) toBottom();
+    },
+    // Citation chips (web search), rendered after the answer; click opens the source in a new tab.
+    sources:function(list){
+      if(!curBubble || !list || !list.length) return;
+      var stick=atBottom();
+      var wrap=document.createElement('div'); wrap.className='ai-src';
+      var head=document.createElement('div'); head.className='ai-src-h'; head.textContent='Sources'; wrap.appendChild(head);
+      list.forEach(function(s,i){
+        var a=document.createElement('a'); a.className='ai-srcchip';
+        a.textContent='['+(i+1)+'] '+(s.title||s.url); a.title=s.url;
+        a.addEventListener('click',function(e){ e.preventDefault(); post({cmd:'ai_open_url', url:s.url}); });
+        wrap.appendChild(a);
+      });
+      if(curCursor) curBubble.insertBefore(wrap,curCursor); else curBubble.appendChild(wrap);
+      if(stick) toBottom();
+    },
+    done:function(error){
+      if(curCursor){ curCursor.remove(); curCursor=null; }
+      if(error && curBubble){
+        if(!curBubble.textContent.trim()){
+          curBubble.parentNode.className='msg err';
+          curBubble.textContent='⚠ '+error;
+        } else {
+          var n=document.createElement('div'); n.style.cssText='color:#ff8f8f;font-size:12px;margin-top:6px';
+          n.textContent='⚠ '+error; curBubble.appendChild(n);
+        }
+      }
+      curBubble=null; setStreaming(false); toBottom();
+    },
+    clear:function(){
+      Array.prototype.slice.call(scroll.querySelectorAll('.msg')).forEach(function(m){m.remove();});
+      if(empty) empty.style.display='';
+      curBubble=null; curCursor=null; setStreaming(false);
+    }
+  };
+
+  // --- events ---
+  send.addEventListener('click',function(){
+    if(streaming){ post({cmd:'ai_stop'}); return; }
+    ask(input.value);
+  });
+  input.addEventListener('input',resize);
+  input.addEventListener('keydown',function(e){
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); if(!streaming) ask(input.value); }
+  });
+  scopeWrap.addEventListener('click',function(e){
+    var b=e.target.closest('button'); if(!b) return;
+    scope=b.dataset.scope;
+    Array.prototype.slice.call(scopeWrap.children).forEach(function(x){x.classList.toggle('on',x===b);});
+  });
+  scroll.addEventListener('click',function(e){
+    var b=e.target.closest('button[data-q]'); if(b) ask(b.dataset.q);
+  });
+  document.getElementById('shot').addEventListener('click',function(){ if(!streaming) ask(input.value,'vision'); });
+  document.getElementById('newchat').addEventListener('click',function(){ post({cmd:'ai_new_chat'}); window.__ai.clear(); });
+  document.getElementById('close').addEventListener('click',function(){ post({cmd:'ai_toggle'}); });
+
+  post({cmd:'ai_ready'});
+})();
+</script>
+</body>
+</html>

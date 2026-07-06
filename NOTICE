@@ -1,0 +1,74 @@
+Aperture
+Copyright 2026 Aperture contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+It includes and depends on third-party software listed below. This file
+satisfies the attribution requirements of those components; it does not modify
+the Apache-2.0 terms.
+
+For a complete, mechanically generated inventory of every transitive dependency
+license, run `cargo about generate` or `cargo bundle-licenses` in the packaging
+step. The entries below cover the components with explicit attribution or
+notice obligations.
+
+================================================================================
+adblock (adblock-rust) — Mozilla Public License 2.0
+================================================================================
+The ad/tracker matching engine. Copyright Brave Software, Inc. and contributors.
+Source: https://github.com/brave/adblock-rust
+Licensed under MPL-2.0. A copy of the MPL-2.0 is available at
+https://www.mozilla.org/MPL/2.0/. The crate is used unmodified as a dependency;
+its source is available at the URL above.
+
+================================================================================
+Lucide icons — ISC License
+================================================================================
+The wireframe UI icons (inlined as SVG path data in src/ui/home.html and
+src/ui/chrome.html) are from Lucide, which derives from Feather.
+Source: https://lucide.dev  /  https://github.com/lucide-icons/lucide
+
+ISC License
+Copyright (c) 2020, Lucide Contributors
+Copyright (c) 2013-2023, Cole Bemis (Feather)
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+tao — Apache License 2.0
+================================================================================
+Cross-platform windowing/event-loop library. Copyright The Tauri Programme
+within The Commons Conservancy. Source: https://github.com/tauri-apps/tao
+Licensed under Apache-2.0 (see LICENSE for the full text).
+
+================================================================================
+Other Rust dependencies
+================================================================================
+These are used unmodified as crate dependencies under permissive licenses:
+
+  wry              Apache-2.0 OR MIT   https://github.com/tauri-apps/wry
+  webview2-com     MIT                 https://github.com/wravery/webview2-com
+  windows          MIT OR Apache-2.0   https://github.com/microsoft/windows-rs
+  windows-core     MIT OR Apache-2.0   https://github.com/microsoft/windows-rs
+  serde            MIT OR Apache-2.0   https://github.com/serde-rs/serde
+  serde_json       MIT OR Apache-2.0   https://github.com/serde-rs/json
+  zeroize          MIT OR Apache-2.0   https://github.com/RustCrypto/utils
+  base64           MIT OR Apache-2.0   https://github.com/marshallpierce/rust-base64
+  embed-resource   MIT                 https://github.com/nabijaczleweli/rust-embed-resource
+
+================================================================================
+Microsoft Edge WebView2 Runtime (system component)
+================================================================================
+Aperture renders web content using the Microsoft Edge WebView2 Evergreen
+Runtime installed on the user's system. The runtime is NOT bundled or
+redistributed with Aperture; it is used as an OS-provided component under
+Microsoft's WebView2 SDK / Distributable Code terms.

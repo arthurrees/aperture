@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<!--
+  New-tab / landing page (file:// start page). Static <a> links navigate; the host injects live data
+  once after load via window.__home.setData({pinned, recent}). Aesthetic: super-minimal, monospace,
+  flat, wireframe (stroke) icons, single accent.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>New Tab</title>
+<style>
+  :root {
+    --bg: #0d0f13; --panel: #14171c; --line: #232830; --line2: #333a45;
+    --fg: #d2d7df; --dim: #6f7682; --faint: #474e58; --accent: #5b9cff;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, "SFMono-Regular", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+               font: 13px/1.5 var(--mono); -webkit-font-smoothing: antialiased; }
+  ::selection { background: rgba(91,156,255,.26); }
+  a { color: inherit; text-decoration: none; }
+  svg { display: block; }
+  body { padding: 22px; }
+
+  /* a framed instrument console that fills the viewport */
+  .console { min-height: calc(100vh - 44px); display: flex; flex-direction: column;
+             border: 1px solid var(--line); border-radius: 14px; position: relative; overflow: hidden;
+             background: radial-gradient(130% 90% at 50% -20%, rgba(91,156,255,.06), transparent 55%), var(--bg); }
+  /* corner registration ticks (instrument feel) */
+  .console::before, .console::after { content: ""; position: absolute; width: 13px; height: 13px;
+             border: 0 solid var(--accent); opacity: .55; pointer-events: none; }
+  .console::before { top: 9px; left: 9px; border-top-width: 1px; border-left-width: 1px; }
+  .console::after  { bottom: 9px; right: 9px; border-bottom-width: 1px; border-right-width: 1px; }
+
+  /* top + bottom status bars */
+  .bar { display: flex; align-items: center; gap: 16px; padding: 15px 26px; }
+  .bar-top { border-bottom: 1px solid var(--line); }
+  .bar-bot { border-top: 1px solid var(--line); margin-top: auto; font-size: 10px;
+             letter-spacing: .22em; text-transform: uppercase; color: var(--dim); }
+  .bar .sp { flex: 1; }
+  .brand { display: flex; align-items: center; gap: 11px; font-weight: 600; letter-spacing: .3em;
+           font-size: 12px; color: var(--fg); }
+  .brand .lens { color: var(--accent); font-size: 15px; letter-spacing: 0; }
+  .brand .sys { letter-spacing: .01em; font-weight: 400; color: var(--dim); text-transform: none; }
+  .bar-r { display: flex; align-items: center; gap: 22px; }
+  .tcol { display: flex; flex-direction: column; align-items: flex-end; }
+  .time { font-size: 21px; font-weight: 600; letter-spacing: .05em; color: var(--fg); font-variant-numeric: tabular-nums; }
+  .date { font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: var(--dim); margin-top: 3px; }
+  .binwrap { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  .binwrap .cap { font-size: 8px; letter-spacing: .26em; text-transform: uppercase; color: var(--faint); }
+
+  .binclock { display: flex; align-items: flex-end; gap: 6px; }
+  .binclock .col { display: flex; flex-direction: column; gap: 4px; }
+  .binclock .col.grp { margin-left: 8px; }
+  .binclock .dot { width: 8px; height: 8px; border-radius: 2px; border: 1px solid var(--line2);
+                   transition: background .15s ease, border-color .15s ease; }
+  .binclock .dot.on { background: var(--accent); border-color: var(--accent); }
+
+  /* hero: a large greeting (search lives in the top omnibox - no redundant box here) */
+  .hero { padding: 50px 26px 38px; }
+  .greet { font-size: 32px; font-weight: 600; letter-spacing: -.015em; color: #eef1f5; }
+  .greet::before { content: "// "; color: var(--accent); font-weight: 700; }
+  .hint { margin: 16px 0 0; color: var(--faint); font-size: 11px; letter-spacing: .02em; }
+  .hint b { color: var(--dim); font-weight: 600; }
+
+  /* body: shortcuts (wide) | pinned+recent rail */
+  .body { flex: 1; display: grid; grid-template-columns: 1.7fr 1fr; border-top: 1px solid var(--line); }
+  .body > * { padding: 24px 26px; }
+  .main { border-right: 1px solid var(--line); }
+  .label { font-size: 10px; letter-spacing: .24em; text-transform: uppercase; color: var(--dim); margin: 0 0 16px; }
+  .label::before { content: "// "; color: var(--accent); }
+
+  .cmds { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 3px; counter-reset: cmd; }
+  .card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px;
+          border: 1px solid transparent; transition: background .13s ease, border-color .13s ease; }
+  .card:hover { background: var(--panel); border-color: var(--line); }
+  .cmds .card { counter-increment: cmd; }
+  .cmds .card::before { content: counter(cmd, decimal-leading-zero); color: var(--faint); font-size: 10px;
+                        flex: 0 0 auto; letter-spacing: .04em; }
+  .card .ico { width: 18px; height: 18px; flex: 0 0 auto; color: var(--dim); }
+  .card:hover .ico { color: var(--accent); }
+  .card .ico svg { width: 18px; height: 18px; }
+  .card .lab { flex: 1 1 auto; min-width: 0; font-size: 13px; color: var(--fg);
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .sub { font-size: 10.5px; color: var(--faint); flex: 0 0 auto; max-width: 44%;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--faint); font-size: 12px; padding: 4px 2px; }
+
+  .rail .panel + .panel { margin-top: 28px; }
+  .list { display: flex; flex-direction: column; }
+  .list .card { gap: 11px; padding: 8px 8px; border-radius: 6px; }
+  .list .card .ico { color: var(--faint); }
+
+  /* trail: a force-directed map of recent browsing (nodes = pages, edges = how you got there) */
+  .trail { border-top: 1px solid var(--line); padding: 18px 26px 16px; }
+  .trail-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+  .trail-head .label { margin: 0; }
+  .seg { display: flex; }
+  .seg button { font: 10px/1 var(--mono); letter-spacing: .14em; color: var(--dim); background: transparent;
+                border: 1px solid var(--line); padding: 5px 9px; cursor: pointer; margin: 0; }
+  .seg button + button { margin-left: -1px; }
+  .seg button:first-child { border-radius: 5px 0 0 5px; }
+  .seg button:last-child { border-radius: 0 5px 5px 0; }
+  .seg button:hover { color: var(--fg); }
+  .seg button.on { color: var(--accent); border-color: var(--accent); position: relative; z-index: 1; }
+  .trail-meta { margin-left: auto; font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: var(--faint); }
+  .trail-wrap { position: relative; }
+  #trailcv { display: block; width: 100%; height: 330px; border: 1px solid var(--line); border-radius: 10px;
+             background: var(--bg); cursor: grab; }
+  #trailcv.dragging { cursor: grabbing; }
+  #trailcv.overnode { cursor: pointer; }
+  .trail-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                 color: var(--faint); font-size: 12px; pointer-events: none; }
+  .trail-read { margin-top: 8px; font-size: 11px; color: var(--faint); min-height: 17px;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trail-read b { color: var(--fg); font-weight: 600; }
+  .trail-read .u { color: var(--dim); }
+
+  @media (max-width: 820px) {
+    .body { grid-template-columns: 1fr; }
+    .main { border-right: 0; border-bottom: 1px solid var(--line); }
+    .bar-r { gap: 14px; } .time { font-size: 17px; }
+  }
+</style>
+</head>
+<body>
+<div class="console">
+  <div class="bar bar-top">
+    <div class="brand"><span class="lens">◈</span>APERTURE</div>
+    <span class="sp"></span>
+    <div class="bar-r">
+      <div class="tcol"><span class="time" id="clock">--:--:--</span><span class="date" id="date"></span></div>
+      <div class="binwrap"><div class="binclock" id="binclock" title="binary clock (HH MM SS)"></div><span class="cap">BCD · H M S</span></div>
+    </div>
+  </div>
+
+  <div class="hero">
+    <div class="greet" id="greet"></div>
+  </div>
+
+  <section class="trail" id="trail-sec" style="display:none">
+    <div class="trail-head">
+      <div class="label">Trail</div>
+      <div class="seg" id="trailseg" title="How far back the map goes"></div>
+      <span class="trail-meta" id="trailmeta"></span>
+    </div>
+    <div class="trail-wrap">
+      <canvas id="trailcv"></canvas>
+      <div class="trail-empty" id="trailempty" style="display:none">Nothing on the trail in this range yet.</div>
+    </div>
+    <div class="trail-read" id="trailread"></div>
+  </section>
+
+  <div class="body">
+    <section class="main">
+      <div class="label">Shortcuts</div>
+      <div class="cmds" id="links"></div>
+    </section>
+    <aside class="rail">
+      <section class="panel" id="pinned-sec" style="display:none">
+        <div class="label">Pinned</div>
+        <div class="list" id="pinned"></div>
+      </section>
+      <section class="panel" id="recent-sec" style="display:none">
+        <div class="label">Recent</div>
+        <div class="list" id="recent"></div>
+      </section>
+    </aside>
+  </div>
+
+</div>
+
+<script>
+  let homeName = '', homeSearch = 'https://duckduckgo.com/?q={q}';
+  function go(q) {
+    q = (q || '').trim(); if (!q) return false;
+    if (/^https?:\/\//i.test(q) || q.startsWith('about:')) { window.location.href = q; return false; }
+    if (q.includes('.') && !q.includes(' ')) { window.location.href = 'https://' + q; return false; }
+    // A plain query -> the configured search engine (DuckDuckGo /html/, which Aperture re-skins).
+    window.location.href = homeSearch.replace('{q}', encodeURIComponent(q));
+    return false;
+  }
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function tick() {
+    const d = new Date(), h = d.getHours();
+    const part = h < 5 ? 'late night' : h < 12 ? 'good morning' : h < 18 ? 'good afternoon' : 'good evening';
+    document.getElementById('greet').textContent = part + (homeName ? ', ' + homeName : '');
+    document.getElementById('clock').textContent = `${pad(h)}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const wd = ['SUN','MON','TUE','WED','THU','FRI','SAT'][d.getDay()];
+    const mo = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getMonth()];
+    document.getElementById('date').textContent = `${wd} · ${mo} ${d.getDate()}`;
+  }
+  tick(); setInterval(tick, 1000);
+
+  // BCD binary clock - 6 columns HH MM SS, MSB on top, bottom-aligned
+  const HEIGHTS = [2, 4, 3, 4, 3, 4];
+  const binCols = HEIGHTS.map((h, idx) => {
+    const c = document.createElement('div');
+    c.className = 'col' + (idx === 2 || idx === 4 ? ' grp' : '');
+    const dots = [];
+    for (let i = 0; i < h; i++) { const d = document.createElement('div'); d.className = 'dot'; c.appendChild(d); dots.push(d); }
+    document.getElementById('binclock').appendChild(c);
+    return { dots, h };
+  });
+  function setCol(col, digit) { for (let i = 0; i < col.h; i++) col.dots[i].classList.toggle('on', !!((digit >> (col.h - 1 - i)) & 1)); }
+  function binTick() {
+    const d = new Date(), s = pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
+    for (let i = 0; i < 6; i++) setCol(binCols[i], +s[i]);
+  }
+  binTick(); setInterval(binTick, 1000);
+
+  // wireframe (stroke) icons
+  // Wireframe icon set - Lucide (ISC license, lucide.dev). Rendered with our own thin 1.6 stroke.
+  const ICN = {
+    mail: '<path d="m22 7-8.991 5.727a2 2 0 0 1-2.009 0L2 7" /> <rect x="2" y="4" width="20" height="16" rx="2" />',
+    calendar: '<path d="M8 2v4" /> <path d="M16 2v4" /> <rect width="18" height="18" x="3" y="4" rx="2" /> <path d="M3 10h18" />',
+    drive: '<path d="M10 16h.01" /> <path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /> <path d="M21.946 12.013H2.054" /> <path d="M6 16h.01" />',
+    doc: '<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" />',
+    grid: '<rect width="7" height="7" x="3" y="3" rx="1" /> <rect width="7" height="7" x="14" y="3" rx="1" /> <rect width="7" height="7" x="14" y="14" rx="1" /> <rect width="7" height="7" x="3" y="14" rx="1" />',
+    video: '<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5" /> <rect x="2" y="6" width="14" height="12" rx="2" />',
+    activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" />',
+    wallet: '<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /> <path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" />',
+    globe: '<circle cx="12" cy="12" r="10" /> <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" /> <path d="M2 12h20" />',
+    code: '<path d="m16 18 6-6-6-6" /> <path d="m8 6-6 6 6 6" />',
+    book: '<path d="M12 7v14" /> <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />',
+    pin: '<path d="M12 17v5" /> <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />',
+    clock: '<circle cx="12" cy="12" r="10" /> <path d="M12 6v6l4 2" />',
+    cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />',
+    music: '<path d="M9 18V5l12-2v13" /> <circle cx="6" cy="18" r="3" /> <circle cx="18" cy="16" r="3" />',
+    image: '<rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />',
+    film: '<rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M7 3v18" /> <path d="M3 7.5h4" /> <path d="M3 12h18" /> <path d="M3 16.5h4" /> <path d="M17 3v18" /> <path d="M17 7.5h4" /> <path d="M17 16.5h4" />',
+    camera: '<path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z" /> <circle cx="12" cy="13" r="3" />',
+    headphones: '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3" />',
+    tv: '<path d="m17 2-5 5-5-5" /> <rect width="20" height="15" x="2" y="7" rx="2" />',
+    play: '<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" />',
+    terminal: '<path d="M12 19h8" /> <path d="m4 17 6-6-6-6" />',
+    cpu: '<path d="M12 20v2" /> <path d="M12 2v2" /> <path d="M17 20v2" /> <path d="M17 2v2" /> <path d="M2 12h2" /> <path d="M2 17h2" /> <path d="M2 7h2" /> <path d="M20 12h2" /> <path d="M20 17h2" /> <path d="M20 7h2" /> <path d="M7 20v2" /> <path d="M7 2v2" /> <rect x="4" y="4" width="16" height="16" rx="2" /> <rect x="8" y="8" width="8" height="8" rx="1" />',
+    bot: '<path d="M12 8V4H8" /> <rect width="16" height="12" x="4" y="8" rx="2" /> <path d="M2 14h2" /> <path d="M20 14h2" /> <path d="M15 13v2" /> <path d="M9 13v2" />',
+    folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />',
+    bookmark: '<path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z" />',
+    star: '<path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z" />',
+    home: '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />',
+    search: '<path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" />',
+    settings: '<path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" /> <circle cx="12" cy="12" r="3" />',
+    briefcase: '<path d="M16 20V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" /> <rect width="20" height="14" x="2" y="6" rx="2" />',
+    card: '<rect width="20" height="14" x="2" y="5" rx="2" /> <line x1="2" x2="22" y1="10" y2="10" />',
+    cart: '<circle cx="8" cy="21" r="1" /> <circle cx="19" cy="21" r="1" /> <path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12" />',
+    map: '<path d="M14.106 5.553a2 2 0 0 0 1.788 0l3.659-1.83A1 1 0 0 1 21 4.619v12.764a1 1 0 0 1-.553.894l-4.553 2.277a2 2 0 0 1-1.788 0l-4.212-2.106a2 2 0 0 0-1.788 0l-3.659 1.83A1 1 0 0 1 3 19.381V6.618a1 1 0 0 1 .553-.894l4.553-2.277a2 2 0 0 1 1.788 0z" /> <path d="M15 5.764v15" /> <path d="M9 3.236v15" />',
+    news: '<path d="M15 18h-5" /> <path d="M18 14h-8" /> <path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-4 0v-9a2 2 0 0 1 2-2h2" /> <rect width="8" height="4" x="10" y="6" rx="1" />',
+    school: '<path d="M21.42 10.922a1 1 0 0 0-.019-1.838L12.83 5.18a2 2 0 0 0-1.66 0L2.6 9.08a1 1 0 0 0 0 1.832l8.57 3.908a2 2 0 0 0 1.66 0z" /> <path d="M22 10v6" /> <path d="M6 12.5V16a6 3 0 0 0 12 0v-3.5" />',
+    chat: '<path d="M2.992 16.342a2 2 0 0 1 .094 1.167l-1.065 3.29a1 1 0 0 0 1.236 1.168l3.413-.998a2 2 0 0 1 1.099.092 10 10 0 1 0-4.777-4.719" />',
+    pen: '<path d="M13 21h8" /> <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />',
+    zap: '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z" />',
+    link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /> <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />',
+    lock: '<rect width="18" height="11" x="3" y="11" rx="2" ry="2" /> <path d="M7 11V7a5 5 0 0 1 10 0v4" />',
+    phone: '<path d="M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384" />',
+    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /> <path d="M16 3.128a4 4 0 0 1 0 7.744" /> <path d="M22 21v-2a4 4 0 0 0-3-3.87" /> <circle cx="9" cy="7" r="4" />',
+    heart: '<path d="M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5" />',
+    compass: '<circle cx="12" cy="12" r="10" /> <path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z" />',
+    game: '<line x1="6" x2="10" y1="11" y2="11" /> <line x1="8" x2="8" y1="9" y2="13" /> <line x1="15" x2="15.01" y1="12" y2="12" /> <line x1="18" x2="18.01" y1="10" y2="10" /> <path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z" />',
+    coffee: '<path d="M10 2v2" /> <path d="M14 2v2" /> <path d="M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1" /> <path d="M6 2v2" />',
+    database: '<ellipse cx="12" cy="5" rx="9" ry="3" /> <path d="M3 5V19A9 3 0 0 0 21 19V5" /> <path d="M3 12A9 3 0 0 0 21 12" />',
+    server: '<rect width="20" height="8" x="2" y="2" rx="2" ry="2" /> <rect width="20" height="8" x="2" y="14" rx="2" ry="2" /> <line x1="6" x2="6.01" y1="6" y2="6" /> <line x1="6" x2="6.01" y1="18" y2="18" />',
+    rss: '<path d="M4 11a9 9 0 0 1 9 9" /> <path d="M4 4a16 16 0 0 1 16 16" /> <circle cx="5" cy="19" r="1" />',
+    chart: '<path d="M3 3v16a2 2 0 0 0 2 2h16" /> <path d="M18 17V9" /> <path d="M13 17V5" /> <path d="M8 17v-3" />',
+  };
+  function svg(name) {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICN[name] || ICN.globe}</svg>`;
+  }
+  function host(url) { try { return new URL(url).host.replace(/^www\./, ''); } catch (e) { return url; } }
+  // Quick links (Shortcuts) are user-editable in settings; the host injects them via setData.
+  // Until that arrives, show a quiet placeholder so the page is never empty.
+  document.getElementById('links').innerHTML = '<span class="empty">loading…</span>';
+
+  window.__home = {
+    setData(data) {
+      data = data || {};
+      if (typeof data.name === 'string') homeName = data.name;
+      if (data.search) homeSearch = data.search;
+      tick();
+      const pin = data.pinned || [], rec = data.recent || [], lnk = data.links || [];
+      const lg = document.getElementById('links'); lg.innerHTML = '';
+      lnk.forEach(l => card3(lg, l.icon, l.label || host(l.url), host(l.url), l.url));
+      if (!lnk.length) lg.innerHTML =
+        '<span class="empty">No shortcuts yet. Add some in settings.</span>';
+      if (pin.length) { document.getElementById('pinned-sec').style.display = '';
+        const g = document.getElementById('pinned'); g.innerHTML = '';
+        pin.forEach(p => card3(g, 'pin', p.title || host(p.url), host(p.url), p.url)); }
+      if (rec.length) { document.getElementById('recent-sec').style.display = '';
+        const g = document.getElementById('recent'); g.innerHTML = '';
+        rec.forEach(r => card3(g, 'clock', r.title || host(r.url), host(r.url), r.url)); }
+      if (data.trail) trailSet(data.trail);
+    },
+  };
+
+  // ---- Trail graph: a force-directed map of recent browsing. Nodes are pages (sized by visit
+  // count), edges are the navigations that connected them. Data arrives via setData({trail}).
+  const TRAIL_RANGES = [[1, '24H'], [3, '3D'], [7, '7D'], [14, '14D'], [30, '30D']];
+  const TRAIL_MAX_NODES = 350;
+  let tVisits = [], tDays = 7;
+  let tNodes = [], tEdges = [], tAlpha = 0, tRunning = false;
+  let tView = { x: 0, y: 0, k: 1 };
+  let tHover = null, tDrag = null, tPan = null, tMoved = 0;
+  const tcv = document.getElementById('trailcv');
+  const tctx = tcv.getContext('2d');
+  const READ_HINT = 'drag to arrange · scroll to zoom · click a node to open it';
+
+  function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function hueOf(h) { let x = 0; for (let i = 0; i < h.length; i++) x = ((x * 31) + h.charCodeAt(i)) >>> 0; return x % 360; }
+
+  function trailSet(t) {
+    tVisits = t.visits || [];
+    tDays = +t.days || 7;
+    const sec = document.getElementById('trail-sec');
+    if (!t.on) { sec.style.display = 'none'; tRunning = false; return; }
+    sec.style.display = '';
+    const seg = document.getElementById('trailseg');
+    if (!seg.childElementCount) {
+      TRAIL_RANGES.forEach(([d, lab]) => {
+        const b = document.createElement('button'); b.textContent = lab; b.dataset.d = d;
+        b.onclick = () => { tDays = d; trailBuild(); };
+        seg.appendChild(b);
+      });
+    }
+    document.getElementById('trailread').textContent = READ_HINT;
+    trailBuild();
+  }
+
+  function trailBuild() {
+    document.querySelectorAll('#trailseg button').forEach(b => b.classList.toggle('on', +b.dataset.d === tDays));
+    const cutoff = Date.now() / 1000 - tDays * 86400;
+    const vis = tVisits.filter(v => v.ts >= cutoff).slice(-2000);
+    const by = new Map();
+    const W = tcv.clientWidth || 800, H = 330;
+    const getNode = (u, nearX, nearY) => {
+      let n = by.get(u);
+      if (!n) {
+        n = { u, title: '', host: host(u), n: 0,
+              x: (nearX == null ? W * (0.15 + 0.7 * Math.random()) : nearX + (Math.random() - 0.5) * 60),
+              y: (nearY == null ? H * (0.15 + 0.7 * Math.random()) : nearY + (Math.random() - 0.5) * 60),
+              vx: 0, vy: 0, fixed: false };
+        by.set(u, n);
+      }
+      return n;
+    };
+    const ew = new Map();
+    for (const v of vis) {
+      let src = null;
+      if (v.f) { src = getNode(v.f); if (!src.n) src.n = 1; }
+      const n = getNode(v.u, src && src.x, src && src.y);
+      n.n++; if (v.t) n.title = v.t; n.ts = v.ts;
+      if (src && src !== n) {
+        const k = v.f + ' ' + v.u;
+        ew.set(k, (ew.get(k) || 0) + 1);
+      }
+    }
+    tNodes = [...by.values()];
+    if (tNodes.length > TRAIL_MAX_NODES) {
+      tNodes.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const keep = new Set(tNodes.slice(0, TRAIL_MAX_NODES));
+      tNodes = tNodes.filter(n => keep.has(n));
+    }
+    const live = new Set(tNodes.map(n => n.u));
+    tEdges = [];
+    for (const [k, w] of ew) {
+      const [a, b] = k.split(' ');
+      if (live.has(a) && live.has(b)) tEdges.push({ a: by.get(a), b: by.get(b), w });
+    }
+    for (const n of tNodes) n.r = Math.min(12, 3.5 + 2.2 * Math.sqrt(n.n - 1));
+    document.getElementById('trailmeta').textContent =
+      tNodes.length ? tNodes.length + ' pages · ' + tEdges.length + ' hops' : '';
+    document.getElementById('trailempty').style.display = tNodes.length ? 'none' : '';
+    tView = { x: 0, y: 0, k: 1 };
+    tAlpha = 1;
+    if (!tRunning && tNodes.length) { tRunning = true; requestAnimationFrame(trailFrame); }
+  }
+
+  function trailStep() {
+    const W = tcv.clientWidth || 800, H = 330;
+    const a = tAlpha;
+    // pairwise repulsion
+    for (let i = 0; i < tNodes.length; i++) {
+      const p = tNodes[i];
+      for (let j = i + 1; j < tNodes.length; j++) {
+        const q = tNodes[j];
+        let dx = p.x - q.x, dy = p.y - q.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 0.25; }
+        if (d2 > 40000) continue;
+        const f = 900 * a / d2;
+        const d = Math.sqrt(d2);
+        dx /= d; dy /= d;
+        p.vx += dx * f; p.vy += dy * f;
+        q.vx -= dx * f; q.vy -= dy * f;
+      }
+    }
+    // springs along edges
+    for (const e of tEdges) {
+      const dx = e.b.x - e.a.x, dy = e.b.y - e.a.y;
+      const d = Math.sqrt(dx * dx + dy * dy) || 1;
+      const target = 60 + 8 * Math.min(4, Math.max(e.a.r, e.b.r));
+      const f = 0.02 * a * (d - target) / d;
+      e.a.vx += dx * f; e.a.vy += dy * f;
+      e.b.vx -= dx * f; e.b.vy -= dy * f;
+    }
+    // gentle pull to center + integrate
+    for (const n of tNodes) {
+      n.vx += (W / 2 - n.x) * 0.0035 * a;
+      n.vy += (H / 2 - n.y) * 0.0035 * a;
+      if (!n.fixed) { n.x += n.vx; n.y += n.vy; }
+      n.vx *= 0.82; n.vy *= 0.82;
+    }
+    tAlpha = Math.max(0, tAlpha - 0.004);
+  }
+
+  function trailDraw() {
+    const dpr = window.devicePixelRatio || 1;
+    const W = tcv.clientWidth, H = 330;
+    if (tcv.width !== Math.round(W * dpr) || tcv.height !== Math.round(H * dpr)) {
+      tcv.width = Math.round(W * dpr); tcv.height = Math.round(H * dpr);
+    }
+    const accent = cssVar('--accent') || '#5b9cff';
+    const dim = cssVar('--line2') || '#333a45';
+    tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    tctx.clearRect(0, 0, W, H);
+    tctx.translate(tView.x, tView.y); tctx.scale(tView.k, tView.k);
+    const hi = tHover ? new Set([tHover]) : null;
+    if (hi) for (const e of tEdges) { if (e.a === tHover) hi.add(e.b); if (e.b === tHover) hi.add(e.a); }
+    for (const e of tEdges) {
+      const on = tHover && (e.a === tHover || e.b === tHover);
+      tctx.strokeStyle = on ? accent : dim;
+      tctx.globalAlpha = on ? 0.9 : Math.min(0.55, 0.22 + 0.11 * e.w);
+      tctx.lineWidth = (on ? 1.4 : 1) / tView.k;
+      tctx.beginPath(); tctx.moveTo(e.a.x, e.a.y); tctx.lineTo(e.b.x, e.b.y); tctx.stroke();
+    }
+    tctx.globalAlpha = 1;
+    for (const n of tNodes) {
+      const on = !hi || hi.has(n);
+      tctx.beginPath();
+      tctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+      tctx.fillStyle = (n === tHover) ? accent : 'hsl(' + hueOf(n.host) + ' 42% 62% / ' + (on ? 0.88 : 0.25) + ')';
+      tctx.fill();
+      if ((n.r >= 5.5 && tView.k > 0.65) || n === tHover) {
+        tctx.fillStyle = (n === tHover) ? accent : cssVar('--dim') || '#6f7682';
+        tctx.globalAlpha = on ? 1 : 0.3;
+        tctx.font = (10 / tView.k) + 'px ' + (cssVar('--mono') || 'monospace');
+        tctx.textAlign = 'center';
+        tctx.fillText(n.host, n.x, n.y + n.r + 11 / tView.k);
+        tctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  function trailFrame() {
+    if (!tRunning) return;
+    if (tAlpha > 0.003) trailStep();
+    trailDraw();
+    requestAnimationFrame(trailFrame);
+  }
+
+  function trailPick(ev) {
+    const r = tcv.getBoundingClientRect();
+    const mx = (ev.clientX - r.left - tView.x) / tView.k;
+    const my = (ev.clientY - r.top - tView.y) / tView.k;
+    let best = null, bd = 1e9;
+    for (const n of tNodes) {
+      const dx = n.x - mx, dy = n.y - my, d = Math.sqrt(dx * dx + dy * dy);
+      if (d < n.r + 5 && d < bd) { best = n; bd = d; }
+    }
+    return { n: best, mx, my };
+  }
+
+  tcv.addEventListener('mousedown', ev => {
+    const p = trailPick(ev);
+    tMoved = 0;
+    if (p.n) { tDrag = p.n; tDrag.fixed = true; }
+    else tPan = { x: ev.clientX - tView.x, y: ev.clientY - tView.y };
+    tcv.classList.add('dragging');
+  });
+  window.addEventListener('mousemove', ev => {
+    if (tDrag) {
+      const r = tcv.getBoundingClientRect();
+      tDrag.x = (ev.clientX - r.left - tView.x) / tView.k;
+      tDrag.y = (ev.clientY - r.top - tView.y) / tView.k;
+      tDrag.vx = tDrag.vy = 0;
+      tMoved += 1; tAlpha = Math.max(tAlpha, 0.25);
+    } else if (tPan) {
+      tView.x = ev.clientX - tPan.x; tView.y = ev.clientY - tPan.y; tMoved += 1;
+    } else if (tNodes.length) {
+      const p = trailPick(ev);
+      if (p.n !== tHover) {
+        tHover = p.n;
+        tcv.classList.toggle('overnode', !!tHover);
+        const rd = document.getElementById('trailread');
+        if (tHover) {
+          rd.innerHTML = '<b></b><span class="u"></span>';
+          rd.firstChild.textContent = tHover.title || tHover.host;
+          rd.lastChild.textContent = ' · ' + tHover.u;
+        } else {
+          rd.textContent = READ_HINT;
+        }
+      }
+    }
+  });
+  window.addEventListener('mouseup', ev => {
+    if (tDrag) {
+      tDrag.fixed = false;
+      if (tMoved < 4) {
+        if (ev.ctrlKey || ev.button === 1) window.open(tDrag.u); else window.location.href = tDrag.u;
+      }
+    }
+    tDrag = null; tPan = null;
+    tcv.classList.remove('dragging');
+  });
+  tcv.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    const r = tcv.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    const k2 = Math.min(4, Math.max(0.3, tView.k * (ev.deltaY < 0 ? 1.15 : 0.87)));
+    tView.x = mx - (mx - tView.x) * (k2 / tView.k);
+    tView.y = my - (my - tView.y) * (k2 / tView.k);
+    tView.k = k2;
+  }, { passive: false });
+  tcv.addEventListener('auxclick', ev => {
+    if (ev.button === 1) { const p = trailPick(ev); if (p.n) { ev.preventDefault(); window.open(p.n.u); } }
+  });
+  window.addEventListener('resize', () => { if (tNodes.length) tAlpha = Math.max(tAlpha, 0.1); });
+  function card3(g, ic, title, sub, url) {
+    const a = document.createElement('a'); a.className = 'card'; a.href = url; a.title = url;
+    a.innerHTML = `<span class="ico">${svg(ic)}</span><span class="lab">${title}</span><span class="sub">${sub || ''}</span>`;
+    g.appendChild(a);
+  }
+</script>
+</body>
+</html>

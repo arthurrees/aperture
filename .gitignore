@@ -1,0 +1,29 @@
+# Rust build artifacts (also redirected outside OneDrive via .cargo/config.toml)
+/target
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock IS committed for a binary/app — do not ignore it.
+
+# WebView2 / browser runtime data (profiles, caches) if created inside the repo
+/userdata/
+/profiles/
+*.ldb
+*.log
+
+# Secrets — never commit Bitwarden session keys or tokens
+.env
+*.session
+bw-session.txt
+
+# Personal / internal docs + machine-specific build config — keep local, out of the public repo
+.cargo/config.toml
+/SESSION_LOG.md
+/PLAN.md
+/CLAUDE.md
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/

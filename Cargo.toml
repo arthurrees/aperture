@@ -1,0 +1,72 @@
+[package]
+name = "aperture"
+version = "0.1.0"
+edition = "2021"
+description = "Aperture — a lightweight, private daily-driver browser (Rust shell over WebView2)"
+license = "Apache-2.0"
+repository = "https://github.com/arthurrees/aperture"
+readme = "README.md"
+
+[dependencies]
+tao = "0.35"
+wry = "0.55"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Raw WebView2 COM for the TrySuspend tab-sleep tier. Caret versions resolve to the SAME
+# webview2-com (0.38.2) / windows-core (0.61.x) that wry 0.55.1 already uses, so the ICoreWebView2
+# wry hands us is the same Rust type our .cast::<ICoreWebView2_3>() expects.
+webview2-com = "0.38"
+windows-core = "0.61"
+
+# Brave's pure-Rust ad/tracker blocking engine (request matching against filter lists).
+adblock = "0.12"
+
+# For the IStream type passed to CreateWebResourceResponse. Same windows 0.61 wry already uses;
+# this just enables the COM feature.
+windows = { version = "0.61", features = [
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage", # CreateStreamOnHGlobal/GetHGlobalFromStream (screenshot capture)
+    "Win32_System_Memory",     # GlobalLock/GlobalSize/GlobalUnlock to read the capture stream
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",  # CreateMutexW (single-instance)
+    "Win32_Security",          # SECURITY_ATTRIBUTES type in CreateMutexW's signature
+    "Win32_Foundation",        # GetLastError / ERROR_ALREADY_EXISTS / HWND
+    "Win32_UI_WindowsAndMessaging", # FindWindowW / SetForegroundWindow (focus existing instance)
+    "Win32_System_Pipes",      # named pipe server: second launch forwards its URL here
+    "Win32_Storage_FileSystem", # ReadFile on the pipe
+    "Win32_System_IO",         # gates ReadFile/ConnectNamedPipe/PIPE_* in this windows version
+] }
+
+# HTTP for the local-AI layer (Ollama on 127.0.0.1) AND the agentic web-search rung (fetching DDG +
+# result pages over HTTPS). default-features=false drops ureq's rustls/ring default; `native-tls`
+# routes TLS through Windows SChannel instead, so the GNU toolchain stays clean (proven in cont.34).
+ureq = { version = "2", default-features = false, features = ["json", "native-tls", "gzip"] }
+native-tls = "0.2"
+# Parse DuckDuckGo's HTML results for the web-search rung.
+regex = "1"
+
+# Wipe the Bitwarden master password from memory after use.
+zeroize = "1"
+
+# Base64-encode the vault item JSON for `bw create item`.
+base64 = "0.22"
+
+# WebAuthn passkey provider: sign assertion challenges with the P-256 passkey read from the vault.
+# (The Bitwarden extension can't run its passkey popout in WebView2's window model, so Aperture
+# performs the assertion itself using the same vault key.)
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+sha2 = "0.10"
+psl = "2"
+
+# Embed the Windows app icon (.ico) into the exe via the resource compiler (windres on GNU).
+[build-dependencies]
+embed-resource = "2"
+
+# Aggressive size/speed for release builds (tuned later in packaging phase)
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,2430 @@
+<!DOCTYPE html>
+<!--
+  Browser chrome UI (v0.5): tab strip + toolbar, docked at the top of the window.
+  Trusted webview; the only one allowed to drive the Rust host. Talks to Rust via
+  window.ipc.postMessage(JSON); Rust pushes state via window.__chrome.* below.
+
+  chrome -> Rust:
+    {"cmd":"navigate","url":"..."} {"cmd":"back"} {"cmd":"forward"} {"cmd":"reload"}
+    {"cmd":"new_tab"} {"cmd":"close_tab","id":N} {"cmd":"switch_tab","id":N} {"cmd":"ready"}
+  Rust -> chrome:
+    window.__chrome.setUrl(url) / setLoading(bool) / setCanGo(back,fwd) / setTabs([{id,title,active}])
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>chrome</title>
+<style>
+  :root {
+    --bg: #14171c;
+    --bg-elev: #1b1f26;
+    --bg-deep: #0d0f13;
+    --stroke: #232830;
+    --fg: #d2d7df;
+    --fg-dim: #6f7682;
+    --accent: #5b9cff;
+    --radius: 7px;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  /* Transparent document background: the webview itself is transparent, so when the host grows the
+     chrome full-window for a dropdown, everything that isn't painted UI shows the live page below.
+     Each resting strip row paints its own opaque background instead of relying on the body's. */
+  html, body {
+    margin: 0; height: 100%;
+    background: transparent;
+    color: var(--fg);
+    font: 13px/1.4 var(--mono);
+    user-select: none;
+    overflow: hidden;
+  }
+
+  /* Tab strip */
+  .tabs {
+    display: flex; align-items: flex-end; gap: 4px;
+    height: 40px; padding: 7px 7px 0 7px;
+    background: var(--bg-deep);
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none;
+    scroll-behavior: smooth;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  /* Workspace switcher: pinned to the strip's left edge, one dot per workspace. */
+  #wsbar { display: flex; align-items: center; gap: 3px; flex: 0 0 auto; align-self: center;
+           position: sticky; left: 0; top: 0; z-index: 3; background: var(--bg-deep);
+           padding: 2px 6px 2px 2px; margin-right: 3px; border-right: 1px solid var(--stroke); }
+  .ws-chip { display: flex; align-items: center; gap: 6px; height: 24px; padding: 0 7px;
+             border-radius: 6px; border: 1px solid transparent; color: var(--fg-dim); cursor: pointer; }
+  .ws-chip:hover { background: var(--bg-elev); }
+  .ws-chip .wd { width: 8px; height: 8px; border-radius: 50%; background: var(--ws, #6b7280); flex: 0 0 auto; }
+  .ws-chip.on { border-color: var(--stroke); background: var(--bg-elev); color: var(--fg); }
+  .ws-chip .wl { font-size: 11px; max-width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ws-add { width: 22px; height: 22px; line-height: 20px; text-align: center; border-radius: 6px;
+            color: var(--fg-dim); cursor: pointer; font-size: 14px; }
+  .ws-add:hover { background: var(--bg-elev); color: var(--fg); }
+  body.vertical #wsbar { border-right: 0; border-bottom: 1px solid var(--stroke);
+                         margin: 0 0 4px; padding: 2px 2px 6px; width: 100%; flex-wrap: wrap; }
+  .tab {
+    display: flex; align-items: center; gap: 8px;
+    /* Equal width across all tabs: every tab targets 200px and shrinks uniformly when the strip is
+       crowded (down to min-width), then the strip scrolls. No growing, so few tabs stay left-aligned. */
+    flex: 0 1 200px; min-width: 58px; height: 33px;
+    padding: 0 7px 0 13px;
+    background: var(--bg-elev);
+    border: 1px solid var(--stroke); border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    color: var(--fg-dim); font-size: 13px;
+    white-space: nowrap; overflow: hidden;
+    cursor: default;
+    transition: background .14s ease, color .14s ease, box-shadow .14s ease;
+  }
+  .tab:hover:not(.active) { background: #21262e; color: var(--fg); }
+  .tab.active { background: var(--bg); color: var(--fg); box-shadow: inset 0 2px 0 var(--accent); }
+  .tab.dragging { opacity: .45; }
+  .tab.drop-before { border-left: 2px solid var(--accent); }
+  .tab.drop-after { border-right: 2px solid var(--accent); }
+  /* Tab group: chip + member-tab tint */
+  .grp-chip { display: flex; align-items: center; gap: 6px; height: 33px; margin: 0 1px; padding: 0 9px;
+              border-radius: 8px 8px 0 0; background: color-mix(in srgb, var(--grp) 16%, transparent);
+              box-shadow: inset 0 2px 0 var(--grp); cursor: default; flex: 0 0 auto; align-self: flex-end;
+              transition: background .12s ease; }
+  .grp-chip:hover { background: color-mix(in srgb, var(--grp) 26%, transparent); }
+  .grp-chip .gd { width: 8px; height: 8px; border-radius: 50%; background: var(--grp); flex: 0 0 auto; }
+  .grp-chip .gl { font-size: 12px; font-weight: 600; color: var(--grp); max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .grp-chip .gc { font: 600 10px var(--mono); color: var(--grp); background: color-mix(in srgb, var(--grp) 22%, transparent); border-radius: 8px; padding: 1px 6px; }
+  .tab.in-group { box-shadow: inset 0 -2px 0 var(--grp); }
+  .tab.in-group.active { box-shadow: inset 0 2px 0 var(--accent), inset 0 -2px 0 var(--grp); }
+  /* Group menu: rename field + color swatches */
+  .grp-rename { width: 100%; box-sizing: border-box; height: 28px; margin-bottom: 6px; background: var(--bg);
+                border: 1px solid var(--stroke); border-radius: 6px; padding: 0 9px; color: var(--fg); font: 12px var(--mono); outline: none; }
+  .grp-rename:focus { border-color: var(--accent); }
+  .grp-colors { display: flex; gap: 6px; padding: 4px 4px 7px; }
+  .grp-colors .sw { width: 17px; height: 17px; border-radius: 50%; cursor: default; box-shadow: 0 0 0 1px rgba(255,255,255,.12) inset; }
+  .grp-colors .sw:hover { transform: scale(1.15); }
+  .grp-colors .sw.on { box-shadow: 0 0 0 2px var(--bg-elev), 0 0 0 3px var(--fg); }
+  .tab .label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; transition: opacity .3s ease; }
+  .tab .x {
+    width: 16px; height: 16px; flex: 0 0 auto;
+    display: grid; place-items: center; border-radius: 4px;
+    font-size: 14px; color: var(--fg-dim);
+    opacity: 0; transition: opacity .12s ease, background .12s ease;
+  }
+  /* Close button appears on hover or for the active tab (keeps narrow tabs uncluttered). */
+  .tab:hover .x, .tab.active .x { opacity: 1; }
+  .tab .x:hover { background: #3a3f49; color: var(--fg); }
+  .tab .pin { width: 15px; height: 15px; flex: 0 0 auto; display: grid; place-items: center;
+              color: var(--fg-dim); opacity: .5; }
+  .tab .pin svg { width: 12px; height: 12px; }
+  .tab .pin:hover { opacity: 1; }
+  .tab.pinned .pin { opacity: 1; color: var(--accent); }
+  /* Pinned = kept loaded permanently (never slept/discarded). Make it glow so it reads as "tagged". */
+  .tab.pinned {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent), inset 0 0 13px -3px rgba(91, 156, 255, .85);
+    background: linear-gradient(180deg, rgba(91, 156, 255, .12), rgba(91, 156, 255, .04));
+  }
+  .tab.pinned.active {
+    background: linear-gradient(180deg, rgba(91, 156, 255, .18), rgba(91, 156, 255, .06));
+  }
+  .tab.pinned .label { color: #e7eaef; }
+  /* Private/temporary tab: a muted purple tint + mask glyph so isolation reads at a glance. */
+  .tab.private { border-color: #8a7fd6; background: linear-gradient(180deg, rgba(138,127,214,.13), rgba(138,127,214,.04)); }
+  .tab.private.active { background: linear-gradient(180deg, rgba(138,127,214,.2), rgba(138,127,214,.07)); }
+  .tab .fav-ph.mask { color: #a99ff0; opacity: 1; }
+  .tab .fav { width: 15px; height: 15px; flex: 0 0 auto; border-radius: 3px; }
+  .tab .fav-ph { width: 15px; height: 15px; flex: 0 0 auto; display: grid; place-items: center; color: var(--fg-dim); opacity: .6; }
+  .tab .fav-ph svg { width: 13px; height: 13px; }
+  .tab .audio { width: 16px; height: 16px; flex: 0 0 auto; display: grid; place-items: center;
+                color: var(--fg-dim); border-radius: 4px; cursor: default; }
+  .tab .audio svg { width: 13px; height: 13px; }
+  .tab .audio:hover { color: var(--fg); background: #3a3f49; }
+  .tab .audio.muted { opacity: .55; }
+  /* Sleeping (suspended/discarded) tabs: dimmed + a moon, so you can see the memory feature working */
+  .tab.napping .label { opacity: .5; font-style: italic; }
+  .tab .zzz { width: 14px; height: 14px; flex: 0 0 auto; color: var(--fg-dim); display: grid; place-items: center; }
+  .tab .zzz svg { width: 12px; height: 12px; }
+  /* Memory HUD pill (how many tabs are napping) */
+  .hud { display: flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px; border-radius: 13px;
+         background: rgba(91,156,255,.12); border: 1px solid rgba(91,156,255,.35); color: var(--accent);
+         font-size: 12px; cursor: default; flex: 0 0 auto; }
+  .hud svg { width: 14px; height: 14px; }
+
+  /* Find-in-page bar (floats at the top-right of the toolbar row) */
+  #findbar { position: fixed; top: 47px; right: 14px; z-index: 70; display: none; align-items: center; gap: 4px;
+             background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 8px; padding: 4px 5px;
+             box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  #findbar.show { display: flex; }
+  #findq { width: 190px; height: 26px; background: var(--bg); color: var(--fg); border: 1px solid var(--stroke);
+           border-radius: 6px; padding: 0 8px; outline: none; font: inherit; user-select: text; }
+  #findq:focus { border-color: var(--accent); }
+  #findcount { font: 11px var(--mono); color: var(--fg-dim); min-width: 34px; text-align: center; padding: 0 2px; }
+  #findbar button { width: 26px; height: 26px; display: grid; place-items: center; background: transparent;
+                    color: var(--fg-dim); border: 0; border-radius: 5px; cursor: pointer; font-size: 14px; }
+  #findbar button:hover { background: var(--bg); color: var(--fg); }
+
+  /* Command palette (Ctrl+K) */
+  #palette { position: fixed; inset: 0; z-index: 65; display: none; background: rgba(10,11,13,.72); }
+  #palette.show { display: block; }
+  .pal-card { width: 560px; max-width: 92vw; margin: 70px auto 0; background: var(--bg-elev);
+              border: 1px solid var(--stroke); border-radius: 12px; box-shadow: 0 16px 50px rgba(0,0,0,.55); overflow: hidden; }
+  #palq { width: 100%; height: 46px; background: var(--bg); color: var(--fg); border: 0;
+          border-bottom: 1px solid var(--stroke); padding: 0 16px; outline: none; font: 14px var(--mono); user-select: text; }
+  #pallist { max-height: 50vh; overflow-y: auto; padding: 6px; }
+  .pal-item { display: flex; align-items: center; gap: 11px; padding: 9px 11px; border-radius: 7px; font-size: 13px; color: var(--fg); white-space: nowrap; cursor: default; }
+  .pal-item .k { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--fg-dim); flex: 0 0 34px; }
+  .pal-item .t { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+  .pal-item.sel, .pal-item:hover { background: var(--bg); }
+  .pal-item.sel { box-shadow: inset 2px 0 0 var(--accent); }
+
+  /* Downloads button badge + popover */
+  #dl { position: relative; }
+  .dlcount { position: absolute; top: 1px; right: 1px; min-width: 13px; height: 13px; padding: 0 3px;
+             border-radius: 7px; background: var(--accent); color: #fff; font: 600 9px var(--mono);
+             display: none; align-items: center; justify-content: center; box-sizing: border-box; }
+  .dlcount.show { display: flex; }
+  /* While a download is in progress: keep the button accent-colored and blink its arrow. */
+  @keyframes dl-blink { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  #dl.busy { color: var(--accent); }
+  #dl.busy svg { animation: dl-blink 1.2s ease-in-out infinite; }
+  /* Transient "downloading…" toast. Sits within the chrome strip (no chrome-grow), over the right
+     end of the bookmark row, and auto-dismisses. */
+  #dltoast { position: fixed; top: 88px; right: 12px; z-index: 84; display: none; align-items: center;
+             gap: 9px; max-width: 300px; height: 26px; padding: 0 13px; border-radius: 13px;
+             background: var(--bg-elev); border: 1px solid rgba(91,156,255,.45); color: var(--fg);
+             font-size: 12px; cursor: default; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+  #dltoast.show { display: flex; animation: ap-fade .14s ease-out; }
+  #dltoast .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: 0 0 auto;
+                  animation: dl-blink 1.1s ease-in-out infinite; }
+  #dltoast .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #dlpop { position: fixed; top: 47px; right: 14px; z-index: 70; width: 320px; display: none;
+           background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 10px;
+           box-shadow: 0 16px 44px rgba(0,0,0,.5); overflow: hidden; }
+  #dlpop.show { display: block; }
+  .dlpop-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 13px;
+                border-bottom: 1px solid var(--stroke); font-size: 12px; font-weight: 600; color: var(--fg); }
+  #dlclear { background: transparent; border: none; color: var(--fg-dim); font: 11px var(--mono); cursor: default; }
+  #dlclear:hover { color: var(--accent); }
+  #dllist { max-height: 320px; overflow-y: auto; padding: 5px; }
+  .dl-empty { padding: 18px 13px; text-align: center; color: var(--fg-dim); font-size: 12px; }
+  .dl-item { display: flex; align-items: center; gap: 10px; padding: 9px 9px; border-radius: 7px; cursor: default; }
+  .dl-item:hover { background: var(--bg); }
+  .dl-item .ic { flex: 0 0 24px; height: 24px; display: grid; place-items: center; color: var(--fg-dim); }
+  .dl-item.done .ic { color: var(--accent); }
+  .dl-item.fail .ic { color: #e06c6c; }
+  .dl-item .meta { flex: 1 1 auto; min-width: 0; }
+  .dl-item .nm { font-size: 12.5px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dl-item .st { font-size: 10.5px; color: var(--fg-dim); margin-top: 2px; }
+  .dl-item .ic svg { width: 16px; height: 16px; }
+
+  /* History viewer (Ctrl+H) - full-window overlay drawn in the chrome webview */
+  #history { position: fixed; inset: 0; z-index: 80; display: none; background: var(--bg); }
+  #history.show { display: block; }
+  .hist-card { max-width: 760px; margin: 0 auto; height: 100%; display: flex; flex-direction: column; }
+  .hist-head { display: flex; align-items: center; gap: 12px; padding: 26px 24px 18px; }
+  .hist-title { font: 600 19px 'Segoe UI', sans-serif; color: var(--fg); flex: 0 0 auto; }
+  #histq { flex: 1 1 auto; height: 34px; background: var(--bg-elev); border: 1px solid var(--stroke);
+           border-radius: 8px; padding: 0 13px; color: var(--fg); font: 13px var(--mono); outline: none; }
+  #histq:focus { border-color: var(--accent); }
+  #histclear { flex: 0 0 auto; height: 34px; padding: 0 13px; background: transparent; border: 1px solid var(--stroke);
+               border-radius: 8px; color: var(--fg-dim); font: 12px var(--mono); cursor: default; }
+  #histclear:hover { border-color: #e06c6c; color: #e06c6c; }
+  .hist-tabs { display: flex; flex: 0 0 auto; }
+  .hist-tabs button { height: 34px; padding: 0 12px; background: transparent; border: 1px solid var(--stroke);
+                      color: var(--fg-dim); cursor: pointer; font: inherit; font-size: 12px; }
+  .hist-tabs button:hover { color: var(--fg); }
+  .hist-tabs button:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+  .hist-tabs button:last-child { border-radius: 0 var(--radius) var(--radius) 0; margin-left: -1px; }
+  .hist-tabs button.on { color: var(--accent); border-color: var(--accent); position: relative; z-index: 1; }
+  #histclose { flex: 0 0 auto; width: 34px; height: 34px; display: grid; place-items: center; background: transparent;
+               border: none; color: var(--fg-dim); font-size: 20px; cursor: default; border-radius: 8px; }
+  #histclose:hover { background: var(--bg-elev); color: var(--fg); }
+  #histlist { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 16px 32px; }
+  .hist-empty { padding: 40px 16px; text-align: center; color: var(--fg-dim); font-size: 13px; }
+  .hist-day { font: 600 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--fg-dim);
+              padding: 18px 8px 7px; }
+  .hist-item { display: flex; align-items: center; gap: 12px; padding: 9px 10px; border-radius: 8px; cursor: default; }
+  .hist-item:hover { background: var(--bg-elev); }
+  .hist-item .meta { flex: 1 1 auto; min-width: 0; }
+  .hist-item .ht { font-size: 13.5px; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-item .hu { font: 11.5px var(--mono); color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+  .hist-item .hx { flex: 0 0 auto; width: 24px; height: 24px; display: grid; place-items: center; border-radius: 5px;
+                   color: var(--fg-dim); font-size: 15px; opacity: 0; }
+  .hist-item:hover .hx { opacity: 1; }
+  .hist-item .hx:hover { background: #3a3f49; color: var(--fg); }
+
+  /* Tab right-click context menu */
+  .ctxwrap { position: fixed; inset: 0; z-index: 60; display: none; }
+  .ctxwrap.show { display: block; }
+  .ctxmenu { position: fixed; min-width: 200px; background: var(--bg-elev); border: 1px solid var(--stroke);
+             border-radius: 8px; padding: 5px; box-shadow: 0 10px 30px rgba(0,0,0,.55); }
+  .ctxmenu .mi { padding: 7px 11px; border-radius: 5px; font-size: 12px; color: var(--fg); white-space: nowrap; cursor: default; }
+  .ctxmenu .mi:hover { background: var(--bg); }
+  .ctxmenu .sep { height: 1px; background: var(--stroke); margin: 5px 6px; }
+  .newtab {
+    width: 28px; height: 28px; flex: 0 0 auto;
+    display: grid; place-items: center; border-radius: 6px;
+    color: var(--fg-dim); font-size: 18px; cursor: default;
+  }
+  .newtab:hover { background: var(--bg-elev); color: var(--fg); }
+
+  /* Toolbar */
+  .bar { display: flex; align-items: center; gap: 6px; height: 44px; padding: 0 10px; background: var(--bg); }
+  button.nav {
+    width: 30px; height: 30px; display: grid; place-items: center;
+    background: transparent; color: var(--fg-dim); border: 0; border-radius: var(--radius);
+    cursor: pointer; transition: background .12s ease, color .12s ease, transform .08s ease;
+  }
+  button.nav svg { width: 17px; height: 17px; }
+  button.nav:hover:not(:disabled) { background: var(--bg-elev); color: var(--fg); }
+  button.nav:active:not(:disabled) { transform: scale(.92); }
+  button.nav:disabled { opacity: .35; cursor: default; }
+  .omnibox {
+    flex: 1 1 auto; display: flex; align-items: center;
+    height: 32px; padding: 0 12px;
+    background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 8px;
+    transition: border-color .12s ease;
+  }
+  .omnibox:focus-within { border-color: var(--accent); }
+  .omnibox .lock { color: var(--fg-dim); margin-right: 9px; display: grid; place-items: center; }
+  .omnibox .lock svg { width: 13px; height: 13px; }
+  #addr { flex: 1 1 auto; background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit; user-select: text; }
+  #addr::placeholder { color: var(--fg-dim); }
+  #zoomchip { flex: 0 0 auto; margin-left: 6px; height: 21px; padding: 0 8px; border-radius: 11px;
+              background: rgba(91,156,255,.14); border: 1px solid rgba(91,156,255,.4); color: var(--accent);
+              font: 600 11px var(--mono); cursor: default; }
+  #zoomchip:hover { background: rgba(91,156,255,.24); }
+  .spinner {
+    width: 14px; height: 14px; margin-left: 8px;
+    border: 2px solid var(--stroke); border-top-color: var(--accent);
+    border-radius: 50%; display: none; animation: spin .7s linear infinite;
+  }
+  .loading .spinner { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #loadbar { position: fixed; left: 0; right: 0; top: 83px; z-index: 58; height: 2px; overflow: hidden;
+             display: none; background: rgba(91,156,255,.12); }
+  #loadbar.show { display: block; }
+  #loadbar::before { content: ""; position: absolute; left: -35%; top: 0; width: 35%; height: 100%;
+                     background: var(--accent); animation: loadslide 1.05s ease-in-out infinite; }
+  @keyframes loadslide { 0% { left: -35%; width: 30%; } 55% { width: 42%; } 100% { left: 100%; width: 30%; } }
+  /* Site-permission prompt (notifications/camera/mic/...): our own styled card under the omnibox lock,
+     replacing WebView2's default grey bubble. */
+  #permpop { position: fixed; left: 14px; top: 84px; z-index: 80; width: 340px; display: none;
+             background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 12px;
+             padding: 15px; box-shadow: 0 18px 50px rgba(0,0,0,.55); }
+  #permpop.show { display: block; animation: ap-fade .12s ease-out; }
+  .perm-top { display: flex; align-items: flex-start; gap: 11px; }
+  .perm-ic { flex: 0 0 auto; width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+             color: var(--accent); background: rgba(91,156,255,.13); border: 1px solid rgba(91,156,255,.32); }
+  .perm-ic svg { width: 18px; height: 18px; }
+  .perm-body { flex: 1 1 auto; min-width: 0; }
+  .perm-host { font-size: 13px; font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .perm-msg { font-size: 12.5px; color: var(--fg-dim); margin-top: 3px; line-height: 1.45; }
+  .perm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  .perm-actions button { font: inherit; font-size: 12.5px; padding: 7px 14px; border-radius: 7px; cursor: pointer; border: 1px solid var(--stroke); }
+  .perm-block { background: transparent; color: var(--fg-dim); }
+  .perm-block:hover { background: var(--bg); color: var(--fg); }
+  .perm-allow { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .perm-allow:hover { filter: brightness(1.08); }
+
+  /* left/top/width are set in JS (positionOmni) to track the omnibox; these are just fallbacks. */
+  #omnisuggest { position: fixed; left: 132px; top: 78px; width: auto; z-index: 75; display: none;
+                 max-height: 360px; overflow-y: auto; background: var(--bg-elev); border: 1px solid var(--stroke);
+                 border-radius: 10px; box-shadow: 0 16px 44px rgba(0,0,0,.5); padding: 5px; }
+  #omnisuggest.show { display: block; }
+  .omni-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; cursor: default; transition: background .1s ease; }
+  .omni-item:hover, .omni-item.sel { background: var(--bg); }
+  .omni-k { flex: 0 0 44px; font-size: 10px; color: var(--fg-dim); text-transform: uppercase; }
+  .omni-meta { flex: 1 1 auto; min-width: 0; }
+  .omni-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+  .omni-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); font-size: 11px; margin-top: 1px; }
+
+  /* Bookmarks bar - prominent chips */
+  .bookmarks { display: flex; align-items: center; gap: 4px; height: 36px; padding: 0 8px;
+               background: var(--bg-deep); border-top: 1px solid var(--stroke);
+               border-bottom: 1px solid var(--stroke);
+               overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+  .bookmarks::-webkit-scrollbar { display: none; }
+  /* Outlined chips: each bookmark/folder reads as a distinct button on the bar. The remove × only
+     appears on hover (like the tabs), keeping resting chips to just their label. */
+  .bm { display: flex; align-items: center; gap: 4px; max-width: 190px; height: 26px;
+        padding: 0 4px 0 8px; border-radius: 6px; color: var(--fg); font-size: 12.5px;
+        background: transparent; border: 1px solid var(--stroke);
+        white-space: nowrap; cursor: default; transition: background .12s ease, border-color .12s ease; }
+  .bm:hover { background: var(--bg-elev); border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke)); }
+  .bm .lbl { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+  .bm .x { width: 15px; height: 15px; display: grid; place-items: center; border-radius: 3px;
+           font-size: 13px; color: var(--fg-dim); opacity: 0;
+           transition: opacity .12s ease, background .12s ease, color .12s ease; }
+  .bm:hover .x { opacity: .75; }
+  .bm .x:hover { background: #3a3f49; color: var(--fg); opacity: 1; }
+  .bookmarks .empty { color: var(--fg-dim); font-size: 11px; opacity: .7; padding-left: 4px; }
+  .bm.more { flex: 0 0 auto; max-width: none; margin-left: auto; padding-right: 11px; color: var(--accent); }
+  .bm.folder { display: inline-flex; align-items: center; gap: 5px; color: var(--accent);
+               border-color: color-mix(in srgb, var(--accent) 30%, var(--stroke)); }
+  .bm.folder .lbl { color: var(--fg); }
+  .bm.folder.drop { border-color: var(--accent); background: var(--bg-elev); }
+  /* Reorder insertion edge while dragging one bookmark over another. */
+  .bm.bm-drop-before { box-shadow: inset 2px 0 0 var(--accent); }
+  .bm.bm-drop-after { box-shadow: inset -2px 0 0 var(--accent); }
+  .bm[draggable="true"] { cursor: grab; }
+  #bmmenu { position: fixed; z-index: 82; display: none; background: var(--bg-elev); border: 1px solid var(--stroke);
+            border-radius: 8px; padding: 4px; min-width: 168px; box-shadow: 0 12px 36px rgba(0,0,0,.5); }
+  #bmmenu.show { display: block; }
+  .bmmenu-item { padding: 8px 10px; border-radius: 6px; font-size: 12.5px; color: var(--fg); cursor: pointer; }
+  .bmmenu-item:hover { background: var(--bg); }
+  .bmmenu-input { width: 100%; height: 30px; background: var(--bg); border: 1px solid var(--stroke); border-radius: 6px;
+                  color: var(--fg); font: inherit; padding: 0 8px; outline: none; }
+  .bmmenu-input:focus { border-color: var(--accent); }
+  #bmadd { position: fixed; z-index: 82; display: none; width: 256px; background: var(--bg-elev); border: 1px solid var(--stroke);
+           border-radius: 10px; padding: 13px; box-shadow: 0 12px 36px rgba(0,0,0,.5); }
+  #bmadd.show { display: block; }
+  .bmadd-h { font-size: 13px; font-weight: 600; color: var(--fg); margin-bottom: 11px; }
+  .bmadd-row { display: flex; align-items: center; gap: 8px; }
+  .bmadd-lab { font-size: 12px; color: var(--fg-dim); flex: 0 0 auto; }
+  .bmadd-sel, .bmadd-inp { flex: 1 1 auto; min-width: 0; height: 30px; background: var(--bg); border: 1px solid var(--stroke);
+                           border-radius: 6px; color: var(--fg); font: inherit; padding: 0 8px; outline: none; }
+  .bmadd-sel:focus, .bmadd-inp:focus { border-color: var(--accent); }
+  .bmadd-done { margin-top: 11px; text-align: right; }
+  .bmadd-done button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 13px; cursor: pointer; font: inherit; }
+  #star.on { color: #ffc83d; }
+  #star.on svg { fill: #ffc83d; stroke: #ffc83d; }
+  #bmpop { position: fixed; top: 119px; right: 12px; z-index: 70; width: 300px; max-height: 360px; overflow-y: auto;
+           display: none; background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 10px;
+           box-shadow: 0 16px 44px rgba(0,0,0,.5); padding: 5px; }
+  #bmpop.show { display: block; }
+  .bmp-item { display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 7px; cursor: default; }
+  .bmp-item:hover { background: var(--bg); }
+  .bmp-item .bt { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+  .bmp-item .bu { font-size: 10.5px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bmp-item .bx { flex: 0 0 auto; width: 18px; height: 18px; display: grid; place-items: center; border-radius: 4px; color: var(--fg-dim); }
+  .bmp-item .bx:hover { background: #3a3f49; color: var(--fg); }
+  #rlpop { position: fixed; top: 47px; right: 12px; z-index: 70; width: 300px; max-height: 380px; overflow-y: auto;
+           display: none; background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 10px;
+           box-shadow: 0 16px 44px rgba(0,0,0,.5); padding: 5px; }
+  #rlpop.show { display: block; }
+  .rlpop-head { padding: 3px 3px 6px; }
+  .rlpop-head button { width: 100%; height: 30px; background: transparent; border: 1px dashed var(--stroke);
+                       color: var(--fg-dim); border-radius: 7px; cursor: pointer; font: inherit; }
+  .rlpop-head button:hover { border-color: var(--accent); color: var(--fg); }
+  .rl-item { display: flex; align-items: center; gap: 8px; padding: 8px 9px; border-radius: 7px; cursor: pointer; }
+  .rl-item:hover { background: var(--bg); }
+  .rl-t { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-size: 13px; }
+  .rl-x { flex: 0 0 auto; background: transparent; border: 0; color: var(--fg-dim); cursor: pointer; font-size: 15px; line-height: 1; }
+  .rl-x:hover { color: #e06c6c; }
+  .rl-empty { padding: 18px; text-align: center; color: var(--fg-dim); font-size: 12px; }
+  #mempop { position: fixed; top: 47px; right: 92px; z-index: 70; width: 330px; display: none;
+            background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 10px;
+            box-shadow: 0 16px 44px rgba(0,0,0,.5); overflow: hidden; }
+  #mempop.show { display: block; }
+  .mem-head { padding: 10px 13px; border-bottom: 1px solid var(--stroke); font-size: 12px; font-weight: 600; }
+  #memlist { max-height: 340px; overflow-y: auto; padding: 5px; }
+  .mem-item { display: flex; align-items: center; gap: 10px; padding: 8px 9px; border-radius: 7px; cursor: default; }
+  .mem-item:hover { background: var(--bg); }
+  .mem-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--fg-dim); }
+  .mem-dot.awake { background: #77d48b; }
+  .mem-dot.sleep { background: var(--accent); }
+  .mem-dot.drop { background: #d7a54a; }
+  .mem-main { flex: 1 1 auto; min-width: 0; }
+  .mem-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+  .mem-state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); font-size: 10.5px; margin-top: 1px; }
+  #restorebar { position: fixed; top: 46px; right: 12px; z-index: 76; display: none; align-items: center; gap: 10px;
+                max-width: 360px; background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 10px;
+                box-shadow: 0 14px 40px rgba(0,0,0,.52); padding: 9px 10px 9px 13px; }
+  #restorebar.show { display: flex; animation: restoreIn .18s ease-out; }
+  @keyframes restoreIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+  #restorebar .rtxt { flex: 1 1 auto; color: var(--fg); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #restorebar button { flex: 0 0 auto; height: 27px; padding: 0 10px; border-radius: 7px; border: 1px solid rgba(91,156,255,.5);
+                       background: rgba(91,156,255,.14); color: var(--accent); font: 12px var(--mono); cursor: default; }
+  #restorebar button:hover { background: rgba(91,156,255,.24); }
+  #restorebar .rx { width: 24px; padding: 0; border-color: var(--stroke); background: transparent; color: var(--fg-dim); }
+
+  /* Bitwarden unlock modal - shown when the chrome webview is expanded to fill the window */
+  .modal { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+           background: rgba(10,11,13,.72); }
+  .modal.show { display: flex; }
+  .modal-card { width: 340px; max-width: 80vw; background: var(--bg-elev);
+                border: 1px solid var(--stroke); border-radius: 12px; padding: 20px;
+                box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+  .modal-title { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .modal-sub { font-size: 12px; color: var(--fg-dim); margin-bottom: 14px; line-height: 1.45; }
+  .modal-head { display: flex; gap: 13px; align-items: flex-start; margin-bottom: 15px; }
+  .modal-ic { flex: 0 0 auto; width: 36px; height: 36px; display: grid; place-items: center;
+              border: 1px solid var(--stroke); border-radius: 9px; color: var(--accent); }
+  .modal-ic svg { width: 19px; height: 19px; }
+  .modal-head .modal-title { margin-bottom: 3px; }
+  .modal-head .modal-sub { margin: 0; }
+  #bwpass { width: 100%; height: 34px; padding: 0 10px; background: var(--bg); color: var(--fg);
+            border: 1px solid var(--stroke); border-radius: 8px; outline: none; font: inherit;
+            user-select: text; }
+  #bwpass:focus { border-color: var(--accent); }
+  .modal-status { min-height: 16px; font-size: 12px; color: #f0a868; margin: 10px 0; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { height: 32px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--stroke);
+         background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
+  .btn:hover { background: var(--bg); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: #3f7ce0; }
+
+  /* Settings - a full-window page (left section nav + scrollable content), shown when the chrome
+     webview fills the window. #settings keeps class="modal" only for the fade-in; the shell fills it. */
+  #settings.modal { align-items: stretch; justify-content: stretch; background: var(--bg-deep); }
+  .settings-shell { width: 100%; height: 100%; display: flex; background: var(--bg-deep); }
+  /* Keyboard shortcuts editor */
+  .kbrow { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--stroke); }
+  .kbrow .kbl { flex: 1 1 auto; font-size: 12.5px; color: var(--fg); }
+  .kbkey { min-width: 150px; height: 26px; padding: 0 12px; background: var(--bg); border: 1px solid var(--stroke);
+           border-radius: 6px; color: var(--fg); font: 11px var(--mono); cursor: pointer; text-align: center;
+           transition: border-color .12s ease, color .12s ease; }
+  .kbkey:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--stroke)); }
+  .kbkey.capturing { border-color: var(--accent); color: var(--accent); }
+  .kbkey.overridden { color: var(--accent); }
+  .kbundo { width: 26px; height: 26px; flex: 0 0 auto; display: grid; place-items: center; background: transparent;
+            border: 0; border-radius: 5px; color: var(--fg-dim); cursor: pointer; font-size: 14px; }
+  .kbundo:hover { background: var(--bg); color: var(--fg); }
+
+  .settings-nav { flex: 0 0 220px; border-right: 1px solid var(--stroke); padding: 20px 12px;
+                  display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
+  .settings-nav .brand { font-size: 15px; font-weight: 600; color: var(--fg); padding: 4px 10px 16px; }
+  .settings-nav a { display: block; padding: 9px 12px; border-radius: 8px; color: var(--fg-dim);
+                    font-size: 13px; cursor: pointer; }
+  .settings-nav a:hover { background: var(--bg); color: var(--fg); }
+  .settings-nav a.on { background: var(--bg); color: var(--accent); font-weight: 600; }
+  .settings-main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .settings-top { display: flex; align-items: center; gap: 8px; padding: 15px 28px;
+                  border-bottom: 1px solid var(--stroke); }
+  .settings-title { font-size: 16px; font-weight: 600; color: var(--fg); }
+  .settings-content { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 28px 60px; }
+  .settings-content section { display: none; max-width: 720px; }
+  .settings-content section.active { display: block; }
+  /* Each section is its own view now, so its heading shouldn't carry the inter-section divider. */
+  .settings-content section .prefs-h { border-top: 0; padding-top: 4px; }
+  .sheet { width: 580px; max-width: 92vw; max-height: 86vh; display: flex; flex-direction: column;
+           background: var(--bg-elev); border: 1px solid var(--stroke); border-radius: 12px;
+           box-shadow: 0 12px 40px rgba(0,0,0,.5); overflow: hidden; }
+  .sheet-head { padding: 18px 20px 13px; border-bottom: 1px solid var(--stroke); }
+  .sheet-body { padding: 14px 20px; overflow-y: auto; }
+  .sheet-foot { padding: 12px 20px; border-top: 1px solid var(--stroke); display: flex;
+                justify-content: space-between; align-items: center; gap: 8px; }
+  .lrow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .lrow .prev { width: 32px; height: 32px; flex: 0 0 auto; display: grid; place-items: center;
+                border: 1px solid var(--stroke); border-radius: 7px; color: var(--accent); }
+  .lrow .prev svg { width: 17px; height: 17px; }
+  .lrow select, .lrow input { height: 32px; background: var(--bg); color: var(--fg); font: inherit;
+                border: 1px solid var(--stroke); border-radius: 7px; padding: 0 8px; outline: none;
+                user-select: text; }
+  .lrow select { flex: 0 0 108px; }
+  .lrow .lbl-in { flex: 0 0 132px; }
+  .lrow .url-in { flex: 1 1 auto; min-width: 0; }
+  .lrow select:focus, .lrow input:focus { border-color: var(--accent); }
+  .lrow .del { width: 30px; height: 30px; flex: 0 0 auto; display: grid; place-items: center;
+               border-radius: 6px; color: var(--fg-dim); cursor: pointer; border: 0;
+               background: transparent; font-size: 17px; }
+  .lrow .del:hover { background: #3a3f49; color: var(--fg); }
+  .addrow { margin-top: 6px; }
+  .addrow button { background: transparent; border: 1px dashed var(--stroke); color: var(--fg-dim);
+               width: 100%; height: 34px; border-radius: 7px; cursor: pointer; font: inherit;
+               transition: border-color .12s ease, color .12s ease; }
+  .addrow button:hover { border-color: var(--accent); color: var(--fg); }
+  .prefs { display: flex; flex-direction: column; gap: 9px; margin-bottom: 16px; }
+  .pref { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--fg-dim); }
+  .pref > span { flex: 0 0 132px; }
+  .pref input { flex: 1 1 auto; min-width: 0; height: 30px; background: var(--bg); color: var(--fg);
+                border: 1px solid var(--stroke); border-radius: 7px; padding: 0 8px; font: inherit; outline: none; }
+  .pref input[type=number] { flex: 0 0 92px; }
+  .pref input:focus { border-color: var(--accent); }
+  .pref em { color: var(--fg-dim); font-style: normal; font-size: 11px; }
+  .prefs-h { font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: var(--fg-dim);
+             font-weight: 600; border-top: 1px solid var(--stroke); padding-top: 13px; margin-bottom: 11px; }
+  .pref select { flex: 1 1 auto; min-width: 0; height: 30px; background: var(--bg); color: var(--fg);
+                 border: 1px solid var(--stroke); border-radius: 7px; padding: 0 8px; font: inherit; outline: none; }
+  .pref select:focus { border-color: var(--accent); }
+  .pref-toggle > span { flex: 1 1 auto; }
+  .pref-toggle input[type=checkbox] { flex: 0 0 auto; width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
+  .pref-color > span { flex: 1 1 auto; }
+  .pref-color input[type=color] { flex: 0 0 46px; height: 26px; padding: 1px; background: var(--bg);
+                                  border: 1px solid var(--stroke); border-radius: 6px; cursor: pointer; }
+  /* Collapsible group: rows gated by a master toggle expand/collapse instead of greying out. */
+  .ai-collapse { display: flex; flex-direction: column; gap: 9px; overflow: hidden; max-height: 600px;
+                 opacity: 1; transition: max-height .25s ease, opacity .2s ease, margin .25s ease; }
+  .ai-collapse.collapsed { max-height: 0; opacity: 0; }
+
+  /* Motion: overlays ease in instead of popping. Entrance only - the host snaps the chrome webview
+     back to toolbar size the instant a full-window modal closes, so an exit fade would just clip. */
+  @keyframes ap-fade  { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes ap-pop   { from { opacity: 0; transform: translateY(8px) scale(.97); }
+                        to   { opacity: 1; transform: translateY(0)   scale(1);   } }
+  @keyframes ap-float { from { opacity: 0; transform: translateY(-6px); }
+                        to   { opacity: 1; transform: translateY(0);    } }
+  /* Backdrops fade; centered cards rise and settle. */
+  .modal.show, #palette.show { animation: ap-fade .14s ease-out; }
+  /* History cross-fades over the live page (the chrome floats above the content): fade in on open,
+     fade out on close - the host shrinks the chrome only after the fade-out finishes. */
+  @keyframes ap-fade-out { from { opacity: 1; } to { opacity: 0; } }
+  #history.show { animation: ap-fade .14s ease-out; }
+  #history.closing { animation: ap-fade-out .13s ease-in forwards; }
+  .modal.show .modal-card, .modal.show .sheet,
+  #palette.show .pal-card { animation: ap-pop .16s cubic-bezier(.2, .7, .3, 1); }
+  #history.show .hist-card { animation: ap-pop .18s cubic-bezier(.2, .7, .3, 1); }
+  /* Floating popovers drop in from just above their anchor */
+  #dlpop.show, #bmpop.show, #mempop.show, #findbar.show { animation: ap-float .14s ease-out; }
+  #omnisuggest.show { animation: ap-fade .1s ease-out; }
+  .ctxwrap.show .ctxmenu { animation: ap-pop .12s cubic-bezier(.2, .7, .3, 1); }
+  /* A freshly opened tab grows open like Chrome's: width expands from 0, pushing its neighbours over.
+     renderTabs resumes it across the strip's frequent rebuilds via a negative animation-delay, so it
+     plays through instead of being wiped a frame after it starts. Only new tab ids get this class. */
+  @keyframes ap-tab-in { from { max-width: 0; min-width: 0; opacity: 0; padding-left: 0; padding-right: 0; }
+                         to   { max-width: 240px; opacity: 1; } }
+  .tab.tab-enter { animation: ap-tab-in .28s cubic-bezier(.2, .7, .3, 1); overflow: hidden; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important;
+    }
+  }
+
+  /* ===== Vertical tabs ===== The host sizes the chrome webview to a full-height left column
+     (SIDEBAR_W wide). Stack toolbar + bookmarks at the top; the tab strip runs down the rest as a
+     scrollable list of full-width rows. Horizontal mode (no .vertical class) is unaffected. */
+  body.vertical { display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+  /* Toolbar wraps; the omnibox claims its own full-width row, action buttons fall below it. */
+  body.vertical .bar { order: 1; height: auto; flex: 0 0 auto; flex-wrap: wrap; gap: 5px; padding: 8px 8px 6px; }
+  body.vertical .bar .omnibox { flex: 1 1 100%; order: 5; }
+  body.vertical #back, body.vertical #forward, body.vertical #reload { order: 1; }
+  body.vertical #reader, body.vertical #ai-btn, body.vertical .hud, body.vertical #dl,
+  body.vertical #print, body.vertical #shot-btn, body.vertical #star, body.vertical #rl-btn,
+  body.vertical #bw, body.vertical #settings-btn { order: 9; }
+  body.vertical #loadbar { order: 2; }
+  /* Bookmarks wrap into rows under the toolbar, capped so the tab list keeps room. */
+  body.vertical .bookmarks { order: 3; height: auto; max-height: 92px; flex: 0 0 auto;
+    flex-wrap: wrap; overflow-y: auto; border-bottom: 1px solid var(--stroke); }
+  /* Tab list fills the remaining height and scrolls vertically. */
+  body.vertical .tabs { order: 4; flex: 1 1 auto; min-height: 0; flex-direction: column;
+    align-items: stretch; height: auto; padding: 7px; gap: 3px; overflow-y: auto; overflow-x: hidden; }
+  body.vertical .tab { flex: 0 0 auto; width: 100%; min-width: 0; height: 34px;
+    border: 1px solid var(--stroke); border-radius: 7px; }
+  body.vertical .tab.active { box-shadow: inset 2px 0 0 var(--accent); }
+  body.vertical .tab.in-group { box-shadow: inset -2px 0 0 var(--grp); }
+  body.vertical .tab.in-group.active { box-shadow: inset 2px 0 0 var(--accent), inset -2px 0 0 var(--grp); }
+  body.vertical .grp-chip { align-self: stretch; height: 30px; border-radius: 7px;
+    box-shadow: inset 2px 0 0 var(--grp); }
+  /* Drop indicators flip to top/bottom edges in a vertical list. */
+  body.vertical .tab.drop-before { border-left: 1px solid var(--stroke); border-top: 2px solid var(--accent); }
+  body.vertical .tab.drop-after { border-right: 1px solid var(--stroke); border-bottom: 2px solid var(--accent); }
+</style>
+</head>
+<body>
+  <div class="tabs" id="tabs"></div>
+  <div class="bar">
+    <button class="nav" id="back" title="Back" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 18l-6-6 6-6"/></svg></button>
+    <button class="nav" id="forward" title="Forward" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+    <button class="nav" id="reload" title="Reload"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3.5V9h-5.5"/></svg></button>
+    <div class="omnibox">
+      <span class="lock" id="lock"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span>
+      <input id="addr" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Search, enter address, or ? to ask AI" />
+      <button id="zoomchip" title="Reset zoom to 100%" style="display:none">100%</button>
+      <div class="spinner"></div>
+    </div>
+    <button class="nav" id="reader" title="Reader mode"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h7a3 3 0 0 1 3 3v11a2.5 2.5 0 0 0-2.5-2.5H4zM20 5h-7a3 3 0 0 0-3 3v11a2.5 2.5 0 0 1 2.5-2.5H20z"/></svg></button>
+    <button class="nav" id="ai-btn" title="Aperture AI (Alt+G)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v9l6.5 3.8"/><path d="M12 12 3.5 7.5"/><path d="M12 12l1.5 9"/></svg></button>
+    <div class="hud" id="hud" style="display:none" title=""><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/></svg><span class="n">0</span></div>
+    <button class="nav" id="dl" title="Downloads" style="display:none"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg><span class="dlcount" id="dlcount"></span></button>
+    <button class="nav" id="print" title="Print"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></button>
+    <button class="nav" id="shot-btn" title="Screenshot page (saved to Downloads)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L8 6H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-4z"/><circle cx="12" cy="13" r="3.5"/></svg></button>
+    <button class="nav" id="star" title="Bookmark this page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-4.5L5 21V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg></button>
+    <button class="nav" id="rl-btn" title="Reading list"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></button>
+    <button class="nav" id="bw" title="Open Bitwarden (unlock vault)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.9 12.1L20 3M18 5l2.2 2.2M14.8 8.2l2.2 2.2"/></svg></button>
+    <button class="nav" id="settings-btn" title="Settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-1.8-.3 1.6 1.6 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-1-1.5 1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0 .3-1.8 1.6 1.6 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.6 1.6 0 0 0 1.5-1 1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V9a1.6 1.6 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg></button>
+  </div>
+  <div id="loadbar"></div>
+  <div class="bookmarks" id="bookmarks"></div>
+  <div id="bmpop"></div>
+  <div id="bmmenu"></div>
+  <div id="bmadd"></div>
+  <div id="rlpop"></div>
+  <div id="permpop"></div>
+  <div id="dltoast"></div>
+  <div id="omnisuggest"></div>
+  <div id="mempop"><div class="mem-head">Tab memory</div><div id="memlist"></div></div>
+  <div id="restorebar"><span class="rtxt" id="restoretxt"></span><button id="restorebtn">Restore tabs</button><button id="restorex" class="rx">x</button></div>
+
+  <div id="ctxwrap" class="ctxwrap"><div id="tabmenu" class="ctxmenu"></div></div>
+
+  <div id="findbar">
+    <input id="findq" type="text" autocomplete="off" spellcheck="false" placeholder="Find in page" />
+    <span id="findcount"></span>
+    <button id="findprev" title="Previous (Shift+Enter)">&#8593;</button>
+    <button id="findnext" title="Next (Enter)">&#8595;</button>
+    <button id="findclose" title="Close (Esc)">&times;</button>
+  </div>
+
+  <div id="palette"><div class="pal-card">
+    <input id="palq" type="text" autocomplete="off" spellcheck="false" placeholder="Jump to a tab, bookmark, or action…" />
+    <div id="pallist"></div>
+  </div></div>
+
+  <div id="dlpop">
+    <div class="dlpop-head"><span>Downloads</span><button id="dlclear" title="Clear finished">Clear</button></div>
+    <div id="dllist"></div>
+  </div>
+
+  <div id="history">
+    <div class="hist-card">
+      <div class="hist-head">
+        <span class="hist-title">History</span>
+        <div class="hist-tabs">
+          <button id="histmh" class="on">History</button>
+          <button id="histma" title="Tabs the auto-archiver closed">Archived</button>
+        </div>
+        <input id="histq" type="text" autocomplete="off" spellcheck="false" placeholder="Search history…" />
+        <button id="histclear" title="Clear all history">Clear all</button>
+        <button id="histclose" title="Close (Esc)">&times;</button>
+      </div>
+      <div id="histlist"></div>
+    </div>
+  </div>
+
+  <div id="profpick" class="modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div>
+          <div class="modal-title">Choose a profile</div>
+          <div class="modal-sub">Each profile keeps its own logins and history.</div>
+        </div>
+      </div>
+      <div id="profpicklist" style="display:flex;flex-direction:column;gap:6px"></div>
+      <div class="modal-actions">
+        <button id="profpickclose" class="btn">Stay here</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="bwmodal" class="modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="modal-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3 21 2M17 4l3 3M14 7l3 3"/></svg></span>
+        <div>
+          <div class="modal-title">Unlock Bitwarden</div>
+          <div class="modal-sub">Fills this login from your vault, then locks again.</div>
+        </div>
+      </div>
+      <input id="bwpass" type="password" placeholder="Master password" autocomplete="off" spellcheck="false" />
+      <div class="modal-status" id="bwstatus"></div>
+      <div class="modal-actions">
+        <button id="bwcancel" class="btn">Cancel</button>
+        <button id="bwunlock" class="btn primary">Unlock</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings" class="modal">
+    <div class="settings-shell">
+      <aside class="settings-nav">
+        <div class="brand">Settings</div>
+        <a data-sec="sec-general" class="on">General</a>
+        <a data-sec="sec-search">Search</a>
+        <a data-sec="sec-ai">AI assistant</a>
+        <a data-sec="sec-privacy">Privacy</a>
+        <a data-sec="sec-trail">Trail</a>
+        <a data-sec="sec-routing">Routing</a>
+        <a data-sec="sec-profiles">Profiles</a>
+        <a data-sec="sec-appearance">Appearance</a>
+        <a data-sec="sec-bookmarks">Bookmarks</a>
+        <a data-sec="sec-shortcuts">Shortcuts</a>
+        <a data-sec="sec-keyboard">Keyboard</a>
+      </aside>
+      <div class="settings-main">
+        <div class="settings-top">
+          <div class="settings-title">Settings</div>
+          <span style="flex:1"></span>
+          <button id="setcancel" class="btn">Close</button>
+          <button id="setsave" class="btn primary">Save</button>
+        </div>
+        <div class="settings-content" id="settings-content">
+          <section id="sec-general">
+            <div class="prefs">
+              <div class="prefs-h" style="border-top:0;padding-top:0">General</div>
+              <label class="pref"><span>Your name</span><input id="setName" type="text" placeholder="shown in the new-tab greeting" autocomplete="off" /></label>
+              <label class="pref"><span>Idle before sleep</span><input id="setIdle" type="number" min="10" step="10" /><em>seconds (applies on restart)</em></label>
+              <label class="pref pref-toggle"><span>Vertical tabs (left column)</span><input id="setVertical" type="checkbox" /></label>
+            </div>
+            <div class="prefs">
+              <div class="prefs-h">Tab archive</div>
+              <label class="pref pref-toggle"><span>Auto-archive idle tabs (pinned tabs never archive)</span><input id="setArchive" type="checkbox" /></label>
+              <div id="arch-body" class="ai-collapse">
+                <label class="pref"><span>Archive after</span><input id="setArchiveDays" type="number" min="1" max="365" step="1" /><em>days unused; find them under History (Ctrl+H) &gt; Archived</em></label>
+              </div>
+            </div>
+            <div id="default-browser-section">
+              <div class="prefs-h">Default browser</div>
+              <div class="addrow"><button id="defbrowser" type="button">Make Aperture the default browser…</button></div>
+              <div id="defbrowser-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px"></div>
+            </div>
+            <div id="backup-section">
+              <div class="prefs-h">Backup</div>
+              <div class="addrow" style="display:flex;gap:8px">
+                <button id="exportbtn" type="button">Export…</button>
+                <button id="importbtn" type="button">Import…</button>
+                <input id="importfile" type="file" accept="application/json,.json" style="display:none" />
+              </div>
+            </div>
+          </section>
+          <section id="sec-search">
+            <div class="prefs">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Search</div>
+              <label class="pref"><span>Default engine</span><input id="setSearch" type="text" placeholder="https://duckduckgo.com/?q={q}" autocomplete="off" spellcheck="false" /><em>use {q} for the query</em></label>
+            </div>
+            <div id="engines-section">
+              <div class="prefs-h">Keyword engines <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(type "keyword query" in the address bar)</em></div>
+              <div id="engrows"></div>
+              <div class="addrow"><button id="addeng" type="button">+ Add engine</button></div>
+            </div>
+          </section>
+          <section id="sec-ai">
+            <div class="prefs" id="ai-prefs">
+              <div class="prefs-h">AI assistant</div>
+              <label class="pref pref-toggle pref-master"><span>Enable AI assistant</span><input id="aiEnabled" type="checkbox" /></label>
+              <div id="ai-body" class="ai-collapse">
+                <label class="pref"><span>Model</span><select id="aiModel"></select></label>
+                <label class="pref"><span>Ollama host</span><input id="aiHost" type="text" spellcheck="false" placeholder="http://127.0.0.1:11434" /></label>
+                <label class="pref"><span>Keep model loaded</span><input id="aiKeep" type="text" spellcheck="false" placeholder="5m" /><em>e.g. 5m, 30s, 0</em></label>
+                <label class="pref pref-toggle"><span>Free GPU when panel closes</span><input id="aiUnload" type="checkbox" /></label>
+                <label class="pref pref-toggle"><span>Selection pill (Explain / Translate / Rewrite)</span><input id="aiPill" type="checkbox" /></label>
+                <label class="pref pref-toggle"><span>Ask from the address bar with "?"</span><input id="aiOmni" type="checkbox" /></label>
+                <label class="pref pref-toggle"><span>Screenshot (vision) button</span><input id="aiVision" type="checkbox" /></label>
+                <label class="pref pref-toggle"><span>Web search scope</span><input id="aiWeb" type="checkbox" /></label>
+                <div id="ai-webn-wrap" class="ai-collapse">
+                  <label class="pref"><span>Web results to read</span><input id="aiWebN" type="number" min="1" max="5" step="1" /></label>
+                </div>
+                <label class="pref"><span>Translate pages to</span><input id="aiTranslate" type="text" spellcheck="false" placeholder="English" /></label>
+              </div>
+            </div>
+          </section>
+          <section id="sec-privacy">
+            <div class="prefs">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Privacy</div>
+              <label class="pref pref-toggle"><span>Forget cookies for other sites between sessions</span><input id="pvClear" type="checkbox" /></label>
+              <div id="pv-allow-wrap" class="ai-collapse">
+                <div class="prefs-h">Keep cookies for <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(these stay signed in; other sites' cookies are cleared on startup)</em></div>
+                <div id="pvrows"></div>
+                <div class="addrow"><button id="addpv" type="button">+ Add site</button></div>
+              </div>
+            </div>
+            <div id="privacy-clear">
+              <div class="prefs-h">Reset</div>
+              <div class="addrow"><button id="clearck" type="button">Clear all cookies now (sign out everywhere)</button></div>
+              <div id="clearck-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px"></div>
+            </div>
+          </section>
+          <section id="sec-trail">
+            <div class="prefs">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Trail</div>
+              <label class="pref pref-toggle"><span>Record the browsing trail (the map on the new-tab page)</span><input id="trOn" type="checkbox" /></label>
+              <div id="tr-body" class="ai-collapse">
+                <label class="pref"><span>Map range</span><input id="trDays" type="number" min="1" max="30" step="1" /><em>days shown when the page opens (the map has its own range picker too)</em></label>
+                <label class="pref"><span>Keep trail for</span><input id="trKeep" type="number" min="1" max="365" step="1" /><em>days; older visits are pruned</em></label>
+              </div>
+            </div>
+            <div id="tr-exclude" class="ai-collapse">
+              <div class="prefs-h">Never record <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(covers subdomains; private tabs are never recorded)</em></div>
+              <div id="trrows"></div>
+              <div class="addrow"><button id="addtr" type="button">+ Add site</button></div>
+            </div>
+            <div id="trail-clear">
+              <div class="prefs-h">Reset</div>
+              <div class="addrow"><button id="trclear" type="button">Clear the trail now</button></div>
+              <div id="trclear-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px"></div>
+            </div>
+          </section>
+          <section id="sec-routing">
+            <div id="atc-section">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Link routing <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(links to these sites open in the chosen workspace; covers subdomains)</em></div>
+              <div id="atcrows"></div>
+              <div class="addrow"><button id="addatc" type="button">+ Add rule</button></div>
+              <div style="font-size:11px;color:var(--fg-dim);margin-top:8px">Tip: right-click a tab and pick "Always open this site here" to add a rule without typing.</div>
+            </div>
+          </section>
+          <section id="sec-profiles">
+            <div id="profiles-section">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Profiles <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(each profile keeps its own logins, history, settings, and extensions; switching relaunches into it)</em></div>
+              <div id="profrows"></div>
+              <div class="addrow" style="display:flex;gap:8px">
+                <input id="profnew" type="text" placeholder="New profile name" autocomplete="off" style="flex:1 1 auto" />
+                <button id="profadd" type="button">+ Create and switch</button>
+              </div>
+              <label class="pref pref-toggle" style="margin-top:12px"><span>Ask which profile at every launch</span><input id="profask" type="checkbox" /></label>
+            </div>
+          </section>
+          <section id="sec-appearance">
+            <div class="prefs" id="appearance-prefs">
+              <div class="prefs-h">Appearance</div>
+              <label class="pref pref-color"><span>Background</span><input id="thBg" type="color" /></label>
+              <label class="pref pref-color"><span>Panel</span><input id="thPanel" type="color" /></label>
+              <label class="pref pref-color"><span>Border</span><input id="thBorder" type="color" /></label>
+              <label class="pref pref-color"><span>Text</span><input id="thText" type="color" /></label>
+              <label class="pref pref-color"><span>Muted text</span><input id="thMuted" type="color" /></label>
+              <label class="pref pref-color"><span>Accent</span><input id="thAccent" type="color" /></label>
+              <div class="addrow"><button id="thReset" type="button">Reset to default</button></div>
+            </div>
+          </section>
+          <section id="sec-bookmarks">
+            <div id="bookmarks-edit">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Bookmarks <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(set a folder name to group them in the bar)</em></div>
+              <div id="bmrows"></div>
+              <div class="addrow"><button id="addbm" type="button">+ Add bookmark</button></div>
+            </div>
+          </section>
+          <section id="sec-shortcuts">
+            <div id="shortcuts-section">
+              <div class="prefs-h">Shortcuts <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(shown on the new-tab page)</em></div>
+              <div id="linkrows"></div>
+              <div class="addrow"><button id="addlink">+ Add shortcut</button></div>
+            </div>
+          </section>
+          <section id="sec-keyboard">
+            <div id="keyboard-section">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Keyboard shortcuts <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(click a binding, then press the new combination; it must include Ctrl or Alt)</em></div>
+              <div id="kbrows"></div>
+              <div class="addrow"><button id="kbresetall" type="button">Reset all to defaults</button></div>
+              <div id="kbmsg" style="font-size:11px;color:#f0a868;margin-top:6px;min-height:14px"></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="savemodal" class="modal">
+    <div class="modal-card">
+      <div class="modal-title">Save login to Bitwarden?</div>
+      <div class="modal-sub" id="savesub">&mdash;</div>
+      <input id="savepass" type="password" placeholder="Bitwarden master password" autocomplete="off" spellcheck="false" />
+      <div class="modal-status" id="savestatus"></div>
+      <div class="modal-actions">
+        <button id="savecancel" class="btn">Not now</button>
+        <button id="savebtn" class="btn primary">Save to vault</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const send = (o) => { try { window.ipc.postMessage(JSON.stringify(o)); } catch (e) {} };
+
+  // The chrome is a ~120px-tall webview docked at the top, so any dropdown taller than that (omnibox
+  // suggestions, the bookmarks/downloads/memory popovers, the tab menu) would be clipped at the webview
+  // edge. When one opens we ask the host to grow the chrome to the full window (menu_open) and restore
+  // it when the last one closes (menu_close). Reference-counted so overlapping opens don't desync.
+  const openOverlays = new Set();
+  let chromeGrown = false;
+  function setOverlay(name, on) {
+    if (on) openOverlays.add(name); else openOverlays.delete(name);
+    const want = openOverlays.size > 0;
+    if (want !== chromeGrown) { chromeGrown = want; send({ cmd: want ? 'menu_open' : 'menu_close' }); }
+  }
+
+  // AI feature flags pushed from the host (setAiConfig). Gate the lens button + omnibox "?".
+  // Model name is host-driven (pushed from store::Settings, whose default is editable in Settings and
+  // the dropdown auto-populates from the user's Ollama). No model is hardcoded in the UI layer.
+  let aiEnabledGlobal = true, aiOmniboxGlobal = true, aiCurrentModel = '';
+  let savedTheme = null; // the persisted theme, for reverting a live preview on Cancel
+
+  // Appearance: the stock dark palette (kept in sync with store::Theme defaults).
+  const DEFAULT_THEME = { background:'#0d0f13', panel:'#14171c', border:'#232830', text:'#d2d7df', muted:'#6f7682', accent:'#5b9cff' };
+  const THEME_IDS = { background:'thBg', panel:'thPanel', border:'thBorder', text:'thText', muted:'thMuted', accent:'thAccent' };
+  function jsLighten(hex, amt) {
+    const h = (hex || '').replace('#', '');
+    if (h.length !== 6) return hex;
+    const ch = (i) => Math.min(255, parseInt(h.substr(i, 2), 16) + amt).toString(16).padStart(2, '0');
+    return '#' + ch(0) + ch(2) + ch(4);
+  }
+  function themeFromInputs() {
+    const t = {};
+    for (const k in THEME_IDS) t[k] = document.getElementById(THEME_IDS[k]).value;
+    return t;
+  }
+  // Live preview: recolor the chrome (which is where the settings panel lives) as the user edits.
+  function applyChromeTheme(t) {
+    const d = document.documentElement.style;
+    d.setProperty('--bg-deep', t.background); d.setProperty('--bg', t.panel);
+    d.setProperty('--bg-elev', jsLighten(t.panel, 12)); d.setProperty('--stroke', t.border);
+    d.setProperty('--fg', t.text); d.setProperty('--fg-dim', t.muted); d.setProperty('--accent', t.accent);
+  }
+  function setThemeInputs(t) {
+    for (const k in THEME_IDS) document.getElementById(THEME_IDS[k]).value = t[k] || DEFAULT_THEME[k];
+  }
+  // Populate the settings model dropdown from the installed-models list, always including the saved one.
+  function renderAiModels(list) {
+    const sel = document.getElementById('aiModel');
+    if (!sel) return;
+    const models = Array.isArray(list) ? list.slice() : [];
+    if (aiCurrentModel && models.indexOf(aiCurrentModel) === -1) models.unshift(aiCurrentModel);
+    sel.innerHTML = '';
+    models.forEach((m) => { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); });
+    if (aiCurrentModel) sel.value = aiCurrentModel;
+  }
+
+  const addr   = document.getElementById('addr');
+  const back   = document.getElementById('back');
+  const fwd     = document.getElementById('forward');
+  const reload = document.getElementById('reload');
+  const printBtn = document.getElementById('print');
+  const tabsEl = document.getElementById('tabs');
+  const bar    = document.querySelector('.bar');
+  const loadbar = document.getElementById('loadbar');
+  const omniSuggest = document.getElementById('omnisuggest');
+  const restoreBar = document.getElementById('restorebar');
+  const restoreTxt = document.getElementById('restoretxt');
+  document.getElementById('restorebtn').onclick = () => send({ cmd: 'restore_closed' });
+  document.getElementById('restorex').onclick = () => restoreBar.classList.remove('show');
+
+  back.onclick   = () => send({ cmd: 'back' });
+  fwd.onclick    = () => send({ cmd: 'forward' });
+  reload.onclick = () => send({ cmd: 'reload' });
+  printBtn.onclick = () => send({ cmd: 'print' });
+  document.getElementById('shot-btn').onclick = () => send({ cmd: 'screenshot' });
+
+  let omniDeleting = false, omniItems = [], omniSel = -1;
+  // What the user actually typed (restored when arrowing back above the first suggestion), and the
+  // active tab's real URL (restored on Esc), so keyboard exploration never loses their input.
+  let omniTyped = '', currentUrl = '';
+  function omniFill() {
+    if (omniSel < 0) { addr.value = omniTyped; return; }
+    const it = omniItems[omniSel];
+    if (it) addr.value = (it.kind === 'go') ? it.label : (it.url || it.label);
+  }
+  function displayUrl(u) { return String(u || '').replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, ''); }
+  function omniBuild(q) {
+    const f = String(q || '').trim().toLowerCase();
+    if (!f) return [];
+    const seen = new Set(), out = [];
+    const add = (kind, label, url, cmd) => {
+      const hay = (label + ' ' + (url || '')).toLowerCase();
+      if (!hay.includes(f)) return;
+      // Dedupe across kinds by destination, so the same URL open as a tab AND in history/bookmarks
+      // shows once (first wins: tab > bookmark > history). Normalize trailing slash + case.
+      const key = (url || label).toLowerCase().replace(/\/+$/, '');
+      if (seen.has(key)) return;
+      seen.add(key); out.push({ kind, label, url, cmd });
+    };
+    lastTabs.forEach(t => add('tab', t.title || displayUrl(t.url) || 'New Tab', t.url || '', { cmd: 'switch_tab', id: t.id }));
+    lastBookmarks.forEach(b => add('mark', b.title || displayUrl(b.url), b.url, { cmd: 'bookmark_open', url: b.url }));
+    lastHistory.forEach(h => add('hist', h.title || displayUrl(h.url), h.url, { cmd: 'history_open', url: h.url }));
+    if (!out.length && f.length > 1) out.push({ kind: 'go', label: q, url: 'Search or navigate', cmd: { cmd: 'navigate', url: q } });
+    return out.slice(0, 8);
+  }
+  // Anchor the suggestions to the omnibox's real position + width, measured each time it opens. The
+  // toolbar's button count changes (and the bar reflows in vertical mode), so a hard-coded inset drifts.
+  function positionOmni() {
+    const r = document.querySelector('.omnibox').getBoundingClientRect();
+    omniSuggest.style.left = r.left + 'px';
+    omniSuggest.style.right = 'auto';
+    omniSuggest.style.width = r.width + 'px';
+    omniSuggest.style.top = (r.bottom + 6) + 'px';
+  }
+  function omniRender() {
+    omniSuggest.innerHTML = '';
+    const omniOpen = omniItems.length > 0 && document.activeElement === addr;
+    if (omniOpen) positionOmni();
+    omniSuggest.classList.toggle('show', omniOpen);
+    // The grow overlay follows FOCUS (set on focus, cleared on blur), not the item count: if it
+    // tracked items, backspacing to an empty field would shrink the chrome, and the shrink path
+    // focuses the active tab - stealing focus from the address bar mid-typing.
+    if (omniOpen) setOverlay('omni', true);
+    omniItems.forEach((it, i) => {
+      const row = document.createElement('div'); row.className = 'omni-item' + (i === omniSel ? ' sel' : '');
+      const k = document.createElement('span'); k.className = 'omni-k'; k.textContent = it.kind;
+      const meta = document.createElement('div'); meta.className = 'omni-meta';
+      const title = document.createElement('div'); title.className = 'omni-title'; title.textContent = it.label;
+      const url = document.createElement('div'); url.className = 'omni-url'; url.textContent = it.url || '';
+      meta.appendChild(title); meta.appendChild(url); row.appendChild(k); row.appendChild(meta);
+      row.onmousedown = (e) => { e.preventDefault(); omniActivate(i); };
+      omniSuggest.appendChild(row);
+    });
+  }
+  // Visual-only hide (keeps the grown chrome + omnibox focus); hideOmni is the full close, used
+  // when focus actually leaves the bar.
+  function hideOmniList() { omniSuggest.classList.remove('show'); }
+  function hideOmni() { hideOmniList(); setOverlay('omni', false); }
+  function omniActivate(i) {
+    const it = omniItems[i];
+    if (!it) return false;
+    hideOmniList();
+    send(it.cmd);
+    addr.blur();
+    return true;
+  }
+  addr.addEventListener('keydown', (e) => {
+    omniDeleting = (e.key === 'Backspace' || e.key === 'Delete');
+    if (e.key === 'ArrowDown' && omniItems.length) {
+      e.preventDefault(); omniSel = Math.min(omniSel + 1, omniItems.length - 1); omniFill(); omniRender(); return;
+    }
+    if (e.key === 'ArrowUp' && omniItems.length) {
+      // Arrowing above the first suggestion (-1) restores what the user typed.
+      e.preventDefault(); omniSel = Math.max(omniSel - 1, -1); omniFill(); omniRender(); return;
+    }
+    if (e.key === 'Escape') {
+      // First Esc closes the suggestions and restores the typed text; a second one reverts the bar
+      // to the page's real URL (selected, so typing starts over) - mirrors the omnibox everyone knows.
+      // List-hide only: the bar keeps focus, so the chrome must stay grown until blur.
+      if (omniSuggest.classList.contains('show')) { hideOmniList(); omniSel = -1; addr.value = omniTyped; return; }
+      addr.value = currentUrl; addr.select(); return;
+    }
+    if (e.key === 'Enter') {
+      if (omniSel >= 0 && omniActivate(omniSel)) { e.preventDefault(); return; }
+      const v = addr.value.trim();
+      if (v.startsWith('?') && aiEnabledGlobal && aiOmniboxGlobal) {
+        // Leading "?" routes to the AI instead of search/navigate (non-intrusive opt-in).
+        const q = v.slice(1).trim();
+        if (q) send({ cmd: 'ai_omnibox', q: q });
+        addr.value = ''; addr.blur();
+      } else if (v) {
+        send({ cmd: 'navigate', url: v });
+        addr.blur();
+      }
+    }
+  });
+  // The blur cleanup is cancellable: if focus bounces (page steals it during load, host re-asserts
+  // it right back), a stale pending hideOmni would shrink the chrome - and the shrink path focuses
+  // the content webview, stealing focus AGAIN and undoing the re-assert.
+  let omniBlurTimer = 0;
+  addr.addEventListener('focus', () => { clearTimeout(omniBlurTimer); addr.select(); omniTyped = addr.value; setOverlay('omni', true); omniItems = omniBuild(addr.value); omniSel = -1; omniRender(); });
+  addr.addEventListener('input', () => {
+    const v = addr.value;
+    omniTyped = v;
+    omniItems = omniBuild(v); omniSel = -1; omniRender();
+    if (v && !omniDeleting) send({ cmd: 'omnibox_typing', text: v });
+  });
+  addr.addEventListener('blur', () => { omniBlurTimer = setTimeout(hideOmni, 120); });
+
+  // Drag-to-reorder: the id of the tab currently being dragged (null when idle).
+  let dragId = null;
+  function tabReorder(targetId, before) {
+    let ids = lastTabs.map(t => t.id);
+    const from = ids.indexOf(dragId);
+    if (from < 0) return;
+    ids.splice(from, 1);
+    let ti = ids.indexOf(targetId);
+    if (ti < 0) ti = ids.length;
+    ids.splice(before ? ti : ti + 1, 0, dragId);
+    send({ cmd: 'reorder_tabs', order: ids });
+  }
+
+  // Tab groups: a colored chip precedes each group's contiguous member tabs; collapsed groups hide
+  // their members behind a count badge.
+  let lastGroups = [];
+  const GROUP_COLORS = ['grey', 'blue', 'red', 'yellow', 'green', 'purple', 'cyan'];
+  function groupColor(name) {
+    return ({ grey: '#6b7280', blue: '#5b9cff', red: '#e06c6c', yellow: '#e0b341', green: '#5cb87a', purple: '#a87fd6', cyan: '#4db8c4' })[name] || '#6b7280';
+  }
+  function renderGroupChip(g, count) {
+    const chip = document.createElement('div');
+    chip.className = 'grp-chip' + (g.collapsed ? ' collapsed' : '');
+    chip.style.setProperty('--grp', groupColor(g.color));
+    const dot = document.createElement('span'); dot.className = 'gd'; chip.appendChild(dot);
+    if (g.name) { const lb = document.createElement('span'); lb.className = 'gl'; lb.textContent = g.name; chip.appendChild(lb); }
+    if (g.collapsed) { const c = document.createElement('span'); c.className = 'gc'; c.textContent = count; chip.appendChild(c); }
+    chip.title = (g.name || 'Group') + ': click to ' + (g.collapsed ? 'expand' : 'collapse') + ', right-click for options';
+    chip.onclick = (e) => { e.stopPropagation(); send({ cmd: 'group_collapse', group: g.id }); };
+    chip.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); showGroupMenu(e.clientX, e.clientY, g); });
+    tabsEl.appendChild(chip);
+  }
+
+  // Workspaces: the strip shows one workspace's tabs at a time; dot chips on the left switch.
+  let wsList = [], wsActive = 0;
+  const wsbarEl = document.createElement('div'); wsbarEl.id = 'wsbar';
+  function wsName(w) { return w.name || 'Space'; }
+  function renderWs() {
+    wsbarEl.innerHTML = '';
+    wsList.forEach(w => {
+      const c = document.createElement('div');
+      c.className = 'ws-chip' + (w.id === wsActive ? ' on' : '');
+      c.style.setProperty('--ws', groupColor(w.color));
+      const d = document.createElement('span'); d.className = 'wd'; c.appendChild(d);
+      if (w.id === wsActive) { const l = document.createElement('span'); l.className = 'wl'; l.textContent = wsName(w); c.appendChild(l); }
+      c.title = wsName(w) + (w.id === wsActive ? ': right-click for options' : ': click to switch');
+      c.onclick = () => { if (w.id !== wsActive) send({ cmd: 'ws_switch', id: w.id }); };
+      c.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); showWsMenu(e.clientX, e.clientY, w); });
+      wsbarEl.appendChild(c);
+    });
+    const add = document.createElement('div'); add.className = 'ws-add'; add.textContent = '+'; add.title = 'New workspace';
+    add.onclick = () => send({ cmd: 'ws_new' });
+    wsbarEl.appendChild(add);
+  }
+  function showWsMenu(x, y, w) {
+    tabMenu.innerHTML = '';
+    const ri = document.createElement('input'); ri.className = 'grp-rename'; ri.value = w.name || ''; ri.placeholder = 'Workspace name';
+    ri.onclick = (e) => e.stopPropagation();
+    ri.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') { send({ cmd: 'ws_rename', id: w.id, name: ri.value }); hideTabMenu(); } };
+    tabMenu.appendChild(ri);
+    const cr = document.createElement('div'); cr.className = 'grp-colors';
+    GROUP_COLORS.forEach(c => {
+      const s = document.createElement('span'); s.className = 'sw' + (c === w.color ? ' on' : ''); s.style.background = groupColor(c); s.title = c;
+      s.onclick = (e) => { e.stopPropagation(); send({ cmd: 'ws_color', id: w.id, color: c }); hideTabMenu(); };
+      cr.appendChild(s);
+    });
+    tabMenu.appendChild(cr);
+    addMenuSep();
+    if (w.id !== wsActive) addMenuItem('Switch here', () => send({ cmd: 'ws_switch', id: w.id }));
+    if (w.id !== 0) addMenuItem('Delete workspace (closes its tabs)', () => send({ cmd: 'ws_delete', id: w.id }));
+    positionMenu(x, y);
+  }
+
+  function renderTabs(tabs) {
+    tabsEl.innerHTML = '';
+    tabsEl.appendChild(wsbarEl);
+    // Only the visible workspace's tabs render; the rest stay hidden but alive (the palette still
+    // finds them across workspaces).
+    tabs = (tabs || []).filter(t => (t.workspace || 0) === wsActive);
+    // Animate only genuinely new tabs: not on every state push (title/favicon/audio re-render the
+    // strip), and not the whole restored set on the first paint after launch.
+    const firstRender = (seenTabIds === null);
+    const known = seenTabIds || new Set();
+    const now = performance.now(); const ENTER_MS = 280;
+    let prevGroup = null, activeEl = null, activeId = null;
+    const counts = {};
+    (tabs || []).forEach(t => { if (t.group != null) counts[t.group] = (counts[t.group] || 0) + 1; if (t.active) activeId = t.id; });
+    for (const t of tabs) {
+      if (t.group !== prevGroup) {
+        prevGroup = t.group;
+        if (t.group != null) { const g = lastGroups.find(x => x.id === t.group); if (g) renderGroupChip(g, counts[t.group]); }
+      }
+      const grp = (t.group != null) ? lastGroups.find(x => x.id === t.group) : null;
+      if (grp && grp.collapsed) continue;
+      const el = document.createElement('div');
+      el.className = 'tab' + (t.active ? ' active' : '') + (t.pinned ? ' pinned' : '') + (t.napping ? ' napping' : '') + (grp ? ' in-group' : '') + (t.private ? ' private' : '');
+      // Open animation: mark the moment a new tab first appears, then keep resuming it (negative
+      // animation-delay) on each rebuild until it has run its course.
+      if (!firstRender && !known.has(t.id) && tabEnterStart[t.id] == null) tabEnterStart[t.id] = now;
+      const ets = tabEnterStart[t.id];
+      if (ets != null) {
+        const elapsed = now - ets;
+        if (elapsed < ENTER_MS) { el.classList.add('tab-enter'); el.style.animationDelay = '-' + elapsed.toFixed(0) + 'ms'; }
+        else { delete tabEnterStart[t.id]; }
+      }
+      if (grp) el.style.setProperty('--grp', groupColor(grp.color));
+      el.title = t.title || 'New Tab';
+      if (t.active) activeEl = el;
+      el.draggable = true;
+      el.onclick = (e) => {
+        if (e.target.classList.contains('x') || e.target.classList.contains('pin')) return;
+        send({ cmd: 'switch_tab', id: t.id });
+      };
+      el.addEventListener('auxclick', (e) => {
+        if (e.button === 1) { e.preventDefault(); send({ cmd: 'close_tab', id: t.id }); }
+      });
+      // Prewake on hover: a suspended (not discarded) tab resumes while the pointer is still over
+      // it, so by the time the click lands the page is already awake.
+      if (t.suspended) {
+        el.addEventListener('mouseenter', () => send({ cmd: 'tab_prewake', id: t.id }), { once: true });
+      }
+      el.addEventListener('contextmenu', (e) => { e.preventDefault(); showTabMenu(e.clientX, e.clientY, t); });
+      el.addEventListener('dragstart', (e) => { dragId = t.id; el.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+      el.addEventListener('dragend', () => { dragId = null; el.classList.remove('dragging'); tabsEl.querySelectorAll('.tab').forEach(x => x.classList.remove('drop-before', 'drop-after')); });
+      el.addEventListener('dragover', (e) => {
+        if (dragId == null || dragId === t.id) return;
+        e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+        const r = el.getBoundingClientRect();
+        const before = document.body.classList.contains('vertical') ? (e.clientY < r.top + r.height / 2) : (e.clientX < r.left + r.width / 2);
+        el.classList.toggle('drop-before', before); el.classList.toggle('drop-after', !before);
+      });
+      el.addEventListener('dragleave', () => { el.classList.remove('drop-before', 'drop-after'); });
+      el.addEventListener('drop', (e) => {
+        if (dragId == null || dragId === t.id) return;
+        e.preventDefault();
+        const r = el.getBoundingClientRect();
+        const before = document.body.classList.contains('vertical') ? (e.clientY < r.top + r.height / 2) : (e.clientX < r.left + r.width / 2);
+        el.classList.remove('drop-before', 'drop-after');
+        tabReorder(t.id, before);
+      });
+
+      const pin = document.createElement('span');
+      pin.className = 'pin';
+      pin.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16v6"/><path d="M8 3h8l-1.3 6.5L18 13H6l3.3-3.5z"/></svg>';
+      pin.title = t.pinned ? 'Unpin (allow sleeping/discard)' : 'Pin (keep awake, never discard)';
+      pin.onclick = (e) => { e.stopPropagation(); send({ cmd: 'toggle_pin', id: t.id }); };
+
+      // Favicon, with a faint globe placeholder when a page has none - keeps every tab's text aligned.
+      const PH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18 14 14 0 0 1 0-18"/></svg>';
+      // Private tabs show a mask glyph instead of a favicon, so they read as isolated at a glance.
+      const MASK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5C5 8 8 8 12 8s7 0 9 1.5c0 4-2 6.5-5 6.5-1.8 0-2.5-1-4-1s-2.2 1-4 1c-3 0-5-2.5-5-6.5z"/></svg>';
+      let fav;
+      if (t.private) {
+        fav = document.createElement('span'); fav.className = 'fav-ph mask'; fav.innerHTML = MASK;
+        fav.title = 'Private tab (isolated, not saved)';
+      } else if (t.favicon) {
+        fav = document.createElement('img'); fav.className = 'fav'; fav.src = t.favicon;
+        fav.onerror = () => { const ph = document.createElement('span'); ph.className = 'fav-ph'; ph.innerHTML = PH; fav.replaceWith(ph); };
+      } else {
+        fav = document.createElement('span'); fav.className = 'fav-ph'; fav.innerHTML = PH;
+      }
+
+      const label = document.createElement('span');
+      label.className = 'label';
+      label.textContent = t.title || 'New Tab';
+
+      const x = document.createElement('span');
+      x.className = 'x';
+      x.textContent = '×';
+      x.onclick = (e) => { e.stopPropagation(); send({ cmd: 'close_tab', id: t.id }); };
+
+      el.appendChild(pin);
+      el.appendChild(fav);
+      if (t.napping) {
+        const z = document.createElement('span'); z.className = 'zzz';
+        z.title = 'Asleep. Memory freed, wakes instantly when you open it';
+        z.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/></svg>';
+        el.appendChild(z);
+      }
+      el.appendChild(label);
+      if (t.audio || t.muted) {
+        const au = document.createElement('span');
+        au.className = 'audio' + (t.muted ? ' muted' : '');
+        au.title = t.muted ? 'Unmute tab' : 'Mute tab';
+        au.innerHTML = t.muted
+          ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M22 9l-6 6M16 9l6 6"/></svg>'
+          : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>';
+        au.onclick = (e) => { e.stopPropagation(); send({ cmd: 'toggle_mute', id: t.id }); };
+        el.appendChild(au);
+      }
+      el.appendChild(x);
+      tabsEl.appendChild(el);
+    }
+    const plus = document.createElement('div');
+    plus.className = 'newtab';
+    plus.title = 'New tab';
+    plus.textContent = '+';
+    plus.onclick = () => send({ cmd: 'new_tab' });
+    tabsEl.appendChild(plus);
+    seenTabIds = new Set((tabs || []).map(t => t.id));
+    // Keep the active tab visible when the strip overflows, but only scroll when it actually changes
+    // (so title/favicon updates don't yank the strip around).
+    if (activeEl && activeId !== lastScrolledActive) {
+      lastScrolledActive = activeId;
+      activeEl.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    }
+  }
+  let lastScrolledActive = null;
+  // Tracks which tab ids have already been rendered, so only a freshly opened tab plays the open
+  // animation. null until the first render (which seeds it without animating the restored tabs).
+  let seenTabIds = null;
+  // Per-id timestamp of when a tab first appeared, so the open animation can RESUME (negative
+  // animation-delay) across the strip's frequent full rebuilds instead of restarting each render.
+  const tabEnterStart = {};
+  // Double-click empty space in the tab strip opens a new tab (Chrome behavior).
+  tabsEl.addEventListener('dblclick', (e) => { if (e.target === tabsEl) send({ cmd: 'new_tab' }); });
+  // Vertical mouse wheel scrolls the tab strip horizontally when it overflows.
+  tabsEl.addEventListener('wheel', (e) => {
+    if (tabsEl.scrollWidth <= tabsEl.clientWidth) return;
+    e.preventDefault(); tabsEl.scrollLeft += (e.deltaY || e.deltaX);
+  }, { passive: false });
+
+  // Tab right-click menu (Chrome-style). The host grows the chrome to full window while it's open so
+  // the menu isn't clipped by the toolbar strip; it shrinks back on close.
+  const ctxWrap = document.getElementById('ctxwrap');
+  const tabMenu = document.getElementById('tabmenu');
+  function hideTabMenu() {
+    if (!ctxWrap.classList.contains('show')) return;
+    ctxWrap.classList.remove('show'); tabMenu.innerHTML = '';
+    setOverlay('ctx', false);
+  }
+  function positionMenu(x, y) {
+    ctxWrap.classList.add('show');
+    setOverlay('ctx', true);
+    const mw = tabMenu.offsetWidth || 210, mh = tabMenu.offsetHeight || 120;
+    tabMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - mw - 6)) + 'px';
+    tabMenu.style.top = Math.max(4, Math.min(y, window.innerHeight - mh - 6)) + 'px';
+  }
+  function addMenuItem(label, onClick) {
+    const mi = document.createElement('div'); mi.className = 'mi'; mi.textContent = label;
+    mi.onclick = (e) => { e.stopPropagation(); onClick(); hideTabMenu(); };
+    tabMenu.appendChild(mi);
+  }
+  function addMenuSep() { const s = document.createElement('div'); s.className = 'sep'; tabMenu.appendChild(s); }
+  function showTabMenu(x, y, t) {
+    tabMenu.innerHTML = '';
+    addMenuItem('Reload', () => send({ cmd: 'reload_tab', id: t.id }));
+    addMenuItem('Duplicate', () => send({ cmd: 'duplicate_tab', id: t.id }));
+    addMenuItem(t.pinned ? 'Allow sleeping' : 'Keep loaded (never sleep)', () => send({ cmd: 'toggle_pin', id: t.id }));
+    addMenuItem(t.muted ? 'Unmute site' : 'Mute site', () => send({ cmd: 'toggle_mute', id: t.id }));
+    addMenuSep();
+    addMenuItem('Add to new group', () => send({ cmd: 'group_new', id: t.id }));
+    lastGroups.filter(g => g.id !== t.group).forEach(g => {
+      addMenuItem((t.group != null ? 'Move to ' : 'Add to ') + '“' + (g.name || g.color) + '”', () => send({ cmd: 'group_add', id: t.id, group: g.id }));
+    });
+    if (t.group != null) addMenuItem('Remove from group', () => send({ cmd: 'group_remove', id: t.id }));
+    if (wsList.length > 1) {
+      addMenuSep();
+      wsList.filter(w => w.id !== (t.workspace || 0)).forEach(w => {
+        addMenuItem('Move to workspace “' + wsName(w) + '”', () => send({ cmd: 'ws_move_tab', tab: t.id, ws: w.id }));
+      });
+      // Routing quick action: pin this site's links to the tab's current workspace.
+      let h = '';
+      try { h = new URL(t.url).host.replace(/^www\./, ''); } catch (e) {}
+      if (h) {
+        const here = wsList.find(w => w.id === (t.workspace || 0));
+        addMenuItem('Always open ' + h + ' in “' + (here ? wsName(here) : 'Main') + '”',
+          () => send({ cmd: 'atc_add', pattern: h, ws: t.workspace || 0 }));
+      }
+    }
+    positionMenu(x, y);
+  }
+  function showGroupMenu(x, y, g) {
+    tabMenu.innerHTML = '';
+    const ri = document.createElement('input'); ri.className = 'grp-rename'; ri.value = g.name || ''; ri.placeholder = 'Group name';
+    ri.onclick = (e) => e.stopPropagation();
+    ri.onkeydown = (e) => { e.stopPropagation(); if (e.key === 'Enter') { send({ cmd: 'group_rename', group: g.id, name: ri.value }); hideTabMenu(); } };
+    tabMenu.appendChild(ri);
+    const cr = document.createElement('div'); cr.className = 'grp-colors';
+    GROUP_COLORS.forEach(c => {
+      const s = document.createElement('span'); s.className = 'sw' + (c === g.color ? ' on' : ''); s.style.background = groupColor(c); s.title = c;
+      s.onclick = (e) => { e.stopPropagation(); send({ cmd: 'group_color', group: g.id, color: c }); hideTabMenu(); };
+      cr.appendChild(s);
+    });
+    tabMenu.appendChild(cr);
+    addMenuSep();
+    addMenuItem(g.collapsed ? 'Expand group' : 'Collapse group', () => send({ cmd: 'group_collapse', group: g.id }));
+    addMenuItem('Ungroup', () => send({ cmd: 'group_ungroup', group: g.id }));
+    addMenuItem('Close group', () => send({ cmd: 'group_close', group: g.id }));
+    positionMenu(x, y);
+  }
+  ctxWrap.onclick = () => hideTabMenu();
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideTabMenu(); });
+
+  // Bitwarden unlock modal
+  const bwBtn    = document.getElementById('bw');
+  const bwModal  = document.getElementById('bwmodal');
+  const bwPass   = document.getElementById('bwpass');
+  const bwStatus = document.getElementById('bwstatus');
+  const bwUnlock = document.getElementById('bwunlock');
+  const bwCancel = document.getElementById('bwcancel');
+
+  bwBtn.onclick = () => send({ cmd: 'open_extension' });
+  function submitBw() {
+    const v = bwPass.value;
+    if (!v) return;
+    bwStatus.textContent = 'Unlocking…';
+    send({ cmd: 'bw_submit', password: v });
+    bwPass.value = '';
+  }
+  bwUnlock.onclick = submitBw;
+  bwCancel.onclick = () => send({ cmd: 'bw_cancel' });
+  bwPass.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitBw();
+    if (e.key === 'Escape') send({ cmd: 'bw_cancel' });
+  });
+
+  // Bookmarks
+  const starBtn = document.getElementById('star');
+  const bmBar   = document.getElementById('bookmarks');
+  const bmPop   = document.getElementById('bmpop');
+  starBtn.onclick = () => send({ cmd: 'bookmark_toggle' });
+  function renderBookmarks(list) {
+    bmBar.innerHTML = '';
+    if (!list || !list.length) {
+      const e = document.createElement('span');
+      e.className = 'empty';
+      e.textContent = 'No bookmarks yet. Click the star to save this page.';
+      bmBar.appendChild(e);
+      return;
+    }
+    for (const b of list) {
+      const el = document.createElement('div');
+      el.className = 'bm';
+      el.title = b.url;
+      el.onclick = (e) => { if (!e.target.classList.contains('x')) send({ cmd: 'bookmark_open', url: b.url }); };
+      const lbl = document.createElement('span');
+      lbl.className = 'lbl';
+      lbl.textContent = b.title || b.url;
+      const x = document.createElement('span');
+      x.className = 'x';
+      x.textContent = '×';
+      x.onclick = (e) => { e.stopPropagation(); send({ cmd: 'bookmark_remove', url: b.url }); };
+      el.appendChild(lbl);
+      el.appendChild(x);
+      bmBar.appendChild(el);
+    }
+  }
+
+  let lastFolders = [];
+  let dragUrl = null;
+  function closeBmPop() { bmPop.classList.remove('show'); setOverlay('bm', false); }
+  const FOLDER_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;flex:0 0 auto"><path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2z"/></svg>';
+
+  function renderBookmarksOverflow(list) {
+    list = list || lastBookmarks || [];
+    lastBookmarks = list;
+    bmBar.innerHTML = '';
+    const open = (b) => { send({ cmd: 'bookmark_open', url: b.url }); closeBmPop(); };
+    const remove = (b) => send({ cmd: 'bookmark_remove', url: b.url });
+    const chip = (b, parent, overflow) => {
+      const el = document.createElement('div');
+      el.className = overflow ? 'bmp-item' : 'bm';
+      el.title = b.url; el.draggable = true;
+      el.addEventListener('dragstart', (e) => { dragUrl = b.url; e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', b.url); } catch (_) {} });
+      el.addEventListener('dragend', () => { dragUrl = null; });
+      // On the bar, a loose chip is also a drop target: dropping another bookmark before/after it
+      // reorders them (by horizontal midpoint). stopPropagation so the bar's move-out-of-folder drop
+      // doesn't also fire. (Folder chips have their own file-into-folder drop above.)
+      if (!overflow) {
+        el.addEventListener('dragover', (e) => {
+          if (dragUrl == null || dragUrl === b.url) return;
+          e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'move';
+          const r = el.getBoundingClientRect(); const before = e.clientX < r.left + r.width / 2;
+          el.classList.toggle('bm-drop-before', before); el.classList.toggle('bm-drop-after', !before);
+        });
+        el.addEventListener('dragleave', () => el.classList.remove('bm-drop-before', 'bm-drop-after'));
+        el.addEventListener('drop', (e) => {
+          if (dragUrl == null || dragUrl === b.url) { el.classList.remove('bm-drop-before', 'bm-drop-after'); return; }
+          e.preventDefault(); e.stopPropagation();
+          const r = el.getBoundingClientRect(); const before = e.clientX < r.left + r.width / 2;
+          el.classList.remove('bm-drop-before', 'bm-drop-after');
+          send({ cmd: 'bookmark_reorder', url: dragUrl, target: b.url, before: before });
+          dragUrl = null;
+        });
+      }
+      const lbl = document.createElement('span'); lbl.className = overflow ? 'bt' : 'lbl'; lbl.textContent = b.title || b.url;
+      const x = document.createElement('span'); x.className = overflow ? 'bx' : 'x'; x.textContent = '×'; x.title = 'Remove';
+      x.onclick = (e) => { e.stopPropagation(); remove(b); };
+      el.onclick = (e) => { if (!e.target.classList.contains('x') && !e.target.classList.contains('bx')) open(b); };
+      if (overflow) {
+        const meta = document.createElement('div'); meta.style.minWidth = '0'; meta.style.flex = '1 1 auto';
+        const url = document.createElement('div'); url.className = 'bu'; url.textContent = b.url;
+        meta.appendChild(lbl); meta.appendChild(url); el.appendChild(meta);
+      } else { el.appendChild(lbl); }
+      el.appendChild(x); parent.appendChild(el);
+    };
+    const map = {}, loose = [];
+    (list || []).forEach(b => { const f = (b.folder || '').trim(); if (f) { (map[f] = map[f] || []).push(b); } else loose.push(b); });
+    const folders = lastFolders.slice();
+    Object.keys(map).forEach(f => { if (folders.indexOf(f) === -1) folders.push(f); });
+    folders.forEach(f => {
+      const items = map[f] || [];
+      const el = document.createElement('div'); el.className = 'bm folder'; el.title = f + ' (right-click to delete)';
+      el.innerHTML = FOLDER_SVG;
+      const lbl = document.createElement('span'); lbl.className = 'lbl'; lbl.textContent = f + (items.length ? '  ' + items.length : ''); el.appendChild(lbl);
+      el.onclick = (e) => {
+        e.stopPropagation();
+        if (bmPop.classList.contains('show') && bmPop.dataset.folder === f) { closeBmPop(); return; }
+        bmPop.dataset.folder = f; bmPop.innerHTML = '';
+        if (items.length) items.forEach(b => chip(b, bmPop, true));
+        else { const em = document.createElement('div'); em.className = 'rl-empty'; em.textContent = 'Empty. Drag bookmarks onto this folder'; bmPop.appendChild(em); }
+        const r = el.getBoundingClientRect();
+        bmPop.style.left = Math.max(8, r.left) + 'px'; bmPop.style.top = (r.bottom + 4) + 'px'; bmPop.style.right = 'auto';
+        bmPop.classList.add('show'); setOverlay('bm', true);
+      };
+      el.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); openBmMenu(e.clientX, e.clientY, f); };
+      el.addEventListener('dragover', (e) => { if (dragUrl) { e.preventDefault(); el.classList.add('drop'); } });
+      el.addEventListener('dragleave', () => el.classList.remove('drop'));
+      el.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); el.classList.remove('drop'); if (dragUrl) { send({ cmd: 'bookmark_set_folder', url: dragUrl, folder: f }); dragUrl = null; } });
+      bmBar.appendChild(el);
+    });
+    loose.forEach(b => chip(b, bmBar, false));
+    if (!folders.length && !loose.length) {
+      const e = document.createElement('span'); e.className = 'empty'; e.textContent = 'No bookmarks yet. Click the star to save this page.'; bmBar.appendChild(e);
+    }
+  }
+
+  // Drag a bookmark onto empty bar space -> move it out of any folder (loose).
+  bmBar.addEventListener('dragover', (e) => { if (dragUrl) e.preventDefault(); });
+  bmBar.addEventListener('drop', (e) => { if (dragUrl) { e.preventDefault(); send({ cmd: 'bookmark_set_folder', url: dragUrl, folder: '' }); dragUrl = null; } });
+  bmBar.addEventListener('contextmenu', (e) => { if (e.target === bmBar) { e.preventDefault(); openBmMenu(e.clientX, e.clientY, null); } });
+  bmBar.addEventListener('wheel', (e) => { if (e.deltaY) { bmBar.scrollLeft += e.deltaY; e.preventDefault(); } }, { passive: false });
+  document.addEventListener('click', (e) => { if (bmPop.classList.contains('show') && !bmPop.contains(e.target)) closeBmPop(); });
+
+  // Right-click menu (New folder / Delete folder) + the bookmark-added folder popup.
+  const bmMenu = document.getElementById('bmmenu'), bmAdd = document.getElementById('bmadd');
+  function hideBmMenu() { bmMenu.classList.remove('show'); setOverlay('bmmenu', false); }
+  function openBmMenu(x, y, folder) {
+    bmMenu.innerHTML = '';
+    const item = (label, fn) => { const d = document.createElement('div'); d.className = 'bmmenu-item'; d.textContent = label; d.onclick = (ev) => { ev.stopPropagation(); fn(); }; bmMenu.appendChild(d); };
+    item('New folder…', () => {
+      bmMenu.innerHTML = '';
+      const inp = document.createElement('input'); inp.className = 'bmmenu-input'; inp.placeholder = 'Folder name';
+      inp.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') { const n = inp.value.trim(); if (n) send({ cmd: 'bookmark_new_folder', name: n }); hideBmMenu(); } else if (ev.key === 'Escape') hideBmMenu(); };
+      bmMenu.appendChild(inp); setTimeout(() => inp.focus(), 20);
+    });
+    if (folder) item('Delete folder', () => { send({ cmd: 'bookmark_delete_folder', name: folder }); hideBmMenu(); });
+    bmMenu.style.left = Math.min(x, window.innerWidth - 190) + 'px'; bmMenu.style.top = y + 'px';
+    bmMenu.classList.add('show'); setOverlay('bmmenu', true);
+  }
+  document.addEventListener('click', (e) => { if (bmMenu.classList.contains('show') && !bmMenu.contains(e.target)) hideBmMenu(); });
+
+  function hideBmAdd() { bmAdd.classList.remove('show'); setOverlay('bmadd', false); }
+  function bmAddedPopup(url) {
+    bmAdd.innerHTML = '';
+    const h = document.createElement('div'); h.className = 'bmadd-h'; h.textContent = 'Bookmarked'; bmAdd.appendChild(h);
+    const row = document.createElement('div'); row.className = 'bmadd-row';
+    const lab = document.createElement('span'); lab.className = 'bmadd-lab'; lab.textContent = 'Folder'; row.appendChild(lab);
+    const sel = document.createElement('select'); sel.className = 'bmadd-sel';
+    const mk = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+    // Offer every folder the user can see: the explicit list plus any derived from existing bookmarks
+    // (defensive - stays correct even if the two ever drift).
+    const folders = (lastFolders || []).slice();
+    (lastBookmarks || []).forEach(b => { const f = (b.folder || '').trim(); if (f && folders.indexOf(f) === -1) folders.push(f); });
+    mk('', '(none)'); folders.forEach(f => mk(f, f)); mk('__new', 'New folder…');
+    row.appendChild(sel); bmAdd.appendChild(row);
+    const newWrap = document.createElement('div'); newWrap.className = 'bmadd-row'; newWrap.style.marginTop = '8px'; newWrap.style.display = 'none';
+    const newInp = document.createElement('input'); newInp.className = 'bmadd-inp'; newInp.placeholder = 'New folder name'; newWrap.appendChild(newInp); bmAdd.appendChild(newWrap);
+    sel.onchange = () => {
+      if (sel.value === '__new') { newWrap.style.display = ''; setTimeout(() => newInp.focus(), 20); }
+      else { newWrap.style.display = 'none'; send({ cmd: 'bookmark_set_folder', url: url, folder: sel.value }); }
+    };
+    newInp.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === 'Enter') { const n = newInp.value.trim(); if (n) { send({ cmd: 'bookmark_new_folder', name: n }); send({ cmd: 'bookmark_set_folder', url: url, folder: n }); } hideBmAdd(); } else if (ev.key === 'Escape') hideBmAdd(); };
+    const done = document.createElement('div'); done.className = 'bmadd-done'; const db = document.createElement('button'); db.textContent = 'Done'; db.onclick = () => hideBmAdd(); done.appendChild(db); bmAdd.appendChild(done);
+    const r = document.getElementById('star').getBoundingClientRect();
+    bmAdd.style.top = (r.bottom + 6) + 'px'; bmAdd.style.right = Math.max(8, window.innerWidth - r.right) + 'px'; bmAdd.style.left = 'auto';
+    bmAdd.classList.add('show'); setOverlay('bmadd', true);
+  }
+  document.addEventListener('click', (e) => { const star = document.getElementById('star'); if (bmAdd.classList.contains('show') && !bmAdd.contains(e.target) && e.target !== star && !star.contains(e.target)) hideBmAdd(); });
+
+  // Site-permission prompt: our styled replacement for WebView2's grey bubble. Host sends one per
+  // request via showPermission(); we queue them (one at a time) and report the choice back so the host
+  // completes the deferred WebView2 request. The only way to dismiss is Allow/Block, so no request is
+  // left dangling.
+  const permPop = document.getElementById('permpop');
+  const PERM_IC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>';
+  let permQueue = [], permCurrent = null;
+  function renderPerm() {
+    if (permCurrent || !permQueue.length) return;
+    permCurrent = permQueue.shift();
+    permPop.innerHTML = '';
+    const top = document.createElement('div'); top.className = 'perm-top';
+    const ic = document.createElement('div'); ic.className = 'perm-ic'; ic.innerHTML = PERM_IC;
+    const body = document.createElement('div'); body.className = 'perm-body';
+    const h = document.createElement('div'); h.className = 'perm-host'; h.textContent = permCurrent.host || 'This site';
+    const m = document.createElement('div'); m.className = 'perm-msg'; m.textContent = 'wants to ' + permCurrent.label + '.';
+    body.appendChild(h); body.appendChild(m); top.appendChild(ic); top.appendChild(body);
+    const act = document.createElement('div'); act.className = 'perm-actions';
+    const block = document.createElement('button'); block.className = 'perm-block'; block.textContent = 'Block';
+    const allow = document.createElement('button'); allow.className = 'perm-allow'; allow.textContent = 'Allow';
+    block.onclick = () => decidePerm(false); allow.onclick = () => decidePerm(true);
+    act.appendChild(block); act.appendChild(allow);
+    permPop.appendChild(top); permPop.appendChild(act);
+    permPop.classList.add('show'); setOverlay('perm', true);
+  }
+  function decidePerm(allow) {
+    if (!permCurrent) return;
+    send({ cmd: 'permission_decide', id: permCurrent.id, allow: allow });
+    permCurrent = null;
+    if (permQueue.length) { permPop.classList.remove('show'); renderPerm(); }
+    else { permPop.classList.remove('show'); setOverlay('perm', false); }
+  }
+
+  // Settings - quick-links editor. Same icon set as the home page so previews match what renders.
+  const settingsBtn = document.getElementById('settings-btn');
+  const settingsModal = document.getElementById('settings');
+  const linkRows = document.getElementById('linkrows');
+  let settingsIsHome = true; // whether the gear was opened on the new-tab page (shows the shortcut editor)
+  settingsBtn.onclick = () => send({ cmd: 'open_settings' });
+  document.getElementById('reader').onclick = () => send({ cmd: 'reader' });
+  document.getElementById('ai-btn').onclick = () => send({ cmd: 'ai_toggle' });
+  const zoomChip = document.getElementById('zoomchip');
+  zoomChip.onclick = () => send({ cmd: 'zoom_reset' });
+
+  const ICN = {
+    mail: '<path d="m22 7-8.991 5.727a2 2 0 0 1-2.009 0L2 7" /> <rect x="2" y="4" width="20" height="16" rx="2" />',
+    calendar: '<path d="M8 2v4" /> <path d="M16 2v4" /> <rect width="18" height="18" x="3" y="4" rx="2" /> <path d="M3 10h18" />',
+    drive: '<path d="M10 16h.01" /> <path d="M2.212 11.577a2 2 0 0 0-.212.896V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.527a2 2 0 0 0-.212-.896L18.55 5.11A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /> <path d="M21.946 12.013H2.054" /> <path d="M6 16h.01" />',
+    doc: '<path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /> <path d="M14 2v5a1 1 0 0 0 1 1h5" /> <path d="M10 9H8" /> <path d="M16 13H8" /> <path d="M16 17H8" />',
+    grid: '<rect width="7" height="7" x="3" y="3" rx="1" /> <rect width="7" height="7" x="14" y="3" rx="1" /> <rect width="7" height="7" x="14" y="14" rx="1" /> <rect width="7" height="7" x="3" y="14" rx="1" />',
+    video: '<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5" /> <rect x="2" y="6" width="14" height="12" rx="2" />',
+    activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2" />',
+    wallet: '<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1" /> <path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4" />',
+    globe: '<circle cx="12" cy="12" r="10" /> <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" /> <path d="M2 12h20" />',
+    code: '<path d="m16 18 6-6-6-6" /> <path d="m8 6-6 6 6 6" />',
+    book: '<path d="M12 7v14" /> <path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z" />',
+    pin: '<path d="M12 17v5" /> <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />',
+    clock: '<circle cx="12" cy="12" r="10" /> <path d="M12 6v6l4 2" />',
+    cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />',
+    music: '<path d="M9 18V5l12-2v13" /> <circle cx="6" cy="18" r="3" /> <circle cx="18" cy="16" r="3" />',
+    image: '<rect width="18" height="18" x="3" y="3" rx="2" ry="2" /> <circle cx="9" cy="9" r="2" /> <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />',
+    film: '<rect width="18" height="18" x="3" y="3" rx="2" /> <path d="M7 3v18" /> <path d="M3 7.5h4" /> <path d="M3 12h18" /> <path d="M3 16.5h4" /> <path d="M17 3v18" /> <path d="M17 7.5h4" /> <path d="M17 16.5h4" />',
+    camera: '<path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z" /> <circle cx="12" cy="13" r="3" />',
+    headphones: '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3" />',
+    tv: '<path d="m17 2-5 5-5-5" /> <rect width="20" height="15" x="2" y="7" rx="2" />',
+    play: '<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z" />',
+    terminal: '<path d="M12 19h8" /> <path d="m4 17 6-6-6-6" />',
+    cpu: '<path d="M12 20v2" /> <path d="M12 2v2" /> <path d="M17 20v2" /> <path d="M17 2v2" /> <path d="M2 12h2" /> <path d="M2 17h2" /> <path d="M2 7h2" /> <path d="M20 12h2" /> <path d="M20 17h2" /> <path d="M20 7h2" /> <path d="M7 20v2" /> <path d="M7 2v2" /> <rect x="4" y="4" width="16" height="16" rx="2" /> <rect x="8" y="8" width="8" height="8" rx="1" />',
+    bot: '<path d="M12 8V4H8" /> <rect width="16" height="12" x="4" y="8" rx="2" /> <path d="M2 14h2" /> <path d="M20 14h2" /> <path d="M15 13v2" /> <path d="M9 13v2" />',
+    folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />',
+    bookmark: '<path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z" />',
+    star: '<path d="M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z" />',
+    home: '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />',
+    search: '<path d="m21 21-4.34-4.34" /> <circle cx="11" cy="11" r="8" />',
+    settings: '<path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" /> <circle cx="12" cy="12" r="3" />',
+    briefcase: '<path d="M16 20V4a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16" /> <rect width="20" height="14" x="2" y="6" rx="2" />',
+    card: '<rect width="20" height="14" x="2" y="5" rx="2" /> <line x1="2" x2="22" y1="10" y2="10" />',
+    cart: '<circle cx="8" cy="21" r="1" /> <circle cx="19" cy="21" r="1" /> <path d="M2.05 2.05h2l2.66 12.42a2 2 0 0 0 2 1.58h9.78a2 2 0 0 0 1.95-1.57l1.65-7.43H5.12" />',
+    map: '<path d="M14.106 5.553a2 2 0 0 0 1.788 0l3.659-1.83A1 1 0 0 1 21 4.619v12.764a1 1 0 0 1-.553.894l-4.553 2.277a2 2 0 0 1-1.788 0l-4.212-2.106a2 2 0 0 0-1.788 0l-3.659 1.83A1 1 0 0 1 3 19.381V6.618a1 1 0 0 1 .553-.894l4.553-2.277a2 2 0 0 1 1.788 0z" /> <path d="M15 5.764v15" /> <path d="M9 3.236v15" />',
+    news: '<path d="M15 18h-5" /> <path d="M18 14h-8" /> <path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-4 0v-9a2 2 0 0 1 2-2h2" /> <rect width="8" height="4" x="10" y="6" rx="1" />',
+    school: '<path d="M21.42 10.922a1 1 0 0 0-.019-1.838L12.83 5.18a2 2 0 0 0-1.66 0L2.6 9.08a1 1 0 0 0 0 1.832l8.57 3.908a2 2 0 0 0 1.66 0z" /> <path d="M22 10v6" /> <path d="M6 12.5V16a6 3 0 0 0 12 0v-3.5" />',
+    chat: '<path d="M2.992 16.342a2 2 0 0 1 .094 1.167l-1.065 3.29a1 1 0 0 0 1.236 1.168l3.413-.998a2 2 0 0 1 1.099.092 10 10 0 1 0-4.777-4.719" />',
+    pen: '<path d="M13 21h8" /> <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />',
+    zap: '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z" />',
+    link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /> <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />',
+    lock: '<rect width="18" height="11" x="3" y="11" rx="2" ry="2" /> <path d="M7 11V7a5 5 0 0 1 10 0v4" />',
+    phone: '<path d="M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384" />',
+    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /> <path d="M16 3.128a4 4 0 0 1 0 7.744" /> <path d="M22 21v-2a4 4 0 0 0-3-3.87" /> <circle cx="9" cy="7" r="4" />',
+    heart: '<path d="M2 9.5a5.5 5.5 0 0 1 9.591-3.676.56.56 0 0 0 .818 0A5.49 5.49 0 0 1 22 9.5c0 2.29-1.5 4-3 5.5l-5.492 5.313a2 2 0 0 1-3 .019L5 15c-1.5-1.5-3-3.2-3-5.5" />',
+    compass: '<circle cx="12" cy="12" r="10" /> <path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z" />',
+    game: '<line x1="6" x2="10" y1="11" y2="11" /> <line x1="8" x2="8" y1="9" y2="13" /> <line x1="15" x2="15.01" y1="12" y2="12" /> <line x1="18" x2="18.01" y1="10" y2="10" /> <path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5z" />',
+    coffee: '<path d="M10 2v2" /> <path d="M14 2v2" /> <path d="M16 8a1 1 0 0 1 1 1v8a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1h14a4 4 0 1 1 0 8h-1" /> <path d="M6 2v2" />',
+    database: '<ellipse cx="12" cy="5" rx="9" ry="3" /> <path d="M3 5V19A9 3 0 0 0 21 19V5" /> <path d="M3 12A9 3 0 0 0 21 12" />',
+    server: '<rect width="20" height="8" x="2" y="2" rx="2" ry="2" /> <rect width="20" height="8" x="2" y="14" rx="2" ry="2" /> <line x1="6" x2="6.01" y1="6" y2="6" /> <line x1="6" x2="6.01" y1="18" y2="18" />',
+    rss: '<path d="M4 11a9 9 0 0 1 9 9" /> <path d="M4 4a16 16 0 0 1 16 16" /> <circle cx="5" cy="19" r="1" />',
+    chart: '<path d="M3 3v16a2 2 0 0 0 2 2h16" /> <path d="M18 17V9" /> <path d="M13 17V5" /> <path d="M8 17v-3" />',
+  };
+  const ICON_NAMES = Object.keys(ICN);
+  function iconSvg(name) {
+    return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${ICN[name] || ICN.globe}</svg>`;
+  }
+  function addLinkRow(link) {
+    link = link || { icon: 'globe', label: '', url: '' };
+    const row = document.createElement('div'); row.className = 'lrow';
+    const prev = document.createElement('span'); prev.className = 'prev';
+    prev.innerHTML = iconSvg(link.icon || 'globe');
+    const sel = document.createElement('select');
+    ICON_NAMES.forEach(n => {
+      const o = document.createElement('option'); o.value = n; o.textContent = n;
+      if (n === link.icon) o.selected = true; sel.appendChild(o);
+    });
+    sel.onchange = () => prev.innerHTML = iconSvg(sel.value);
+    const lab = document.createElement('input'); lab.className = 'lbl-in'; lab.placeholder = 'Label'; lab.value = link.label || '';
+    const url = document.createElement('input'); url.className = 'url-in'; url.placeholder = 'https://…'; url.value = link.url || '';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove';
+    del.onclick = () => row.remove();
+    row.append(prev, sel, lab, url, del);
+    linkRows.appendChild(row);
+  }
+  document.getElementById('aiEnabled').addEventListener('change', (e) => {
+    document.getElementById('ai-body').classList.toggle('collapsed', !e.target.checked);
+  });
+  document.getElementById('aiWeb').addEventListener('change', (e) => {
+    document.getElementById('ai-webn-wrap').classList.toggle('collapsed', !e.target.checked);
+  });
+  // Appearance: live-preview the chrome as colors change; reset restores the stock palette.
+  Object.values(THEME_IDS).forEach((id) => {
+    document.getElementById(id).addEventListener('input', () => applyChromeTheme(themeFromInputs()));
+  });
+  document.getElementById('thReset').addEventListener('click', () => {
+    setThemeInputs(DEFAULT_THEME); applyChromeTheme(DEFAULT_THEME);
+  });
+  document.getElementById('addlink').onclick = () => addLinkRow();
+  // Keyword search engines editor (Search section).
+  const engRows = document.getElementById('engrows');
+  function addEngRow(eng) {
+    eng = eng || {};
+    const row = document.createElement('div'); row.className = 'lrow';
+    const kw = document.createElement('input'); kw.className = 'eng-kw'; kw.placeholder = 'kw'; kw.value = eng.keyword || ''; kw.style.flex = '0 0 60px';
+    const nm = document.createElement('input'); nm.className = 'eng-nm'; nm.placeholder = 'Name'; nm.value = eng.name || ''; nm.style.flex = '1 1 0';
+    const url = document.createElement('input'); url.className = 'eng-url'; url.placeholder = 'https://…/search?q={q}'; url.value = eng.url || ''; url.style.flex = '2 1 0';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.append(kw, nm, url, del);
+    engRows.appendChild(row);
+  }
+  document.getElementById('addeng').onclick = () => addEngRow();
+  // Bookmarks editor (Bookmarks section): title / url / folder rows.
+  const bmRows = document.getElementById('bmrows');
+  function addBmRow(bm) {
+    bm = bm || {};
+    const row = document.createElement('div'); row.className = 'lrow';
+    const tt = document.createElement('input'); tt.className = 'bm-tt'; tt.placeholder = 'Title'; tt.value = bm.title || ''; tt.style.flex = '1 1 0';
+    const url = document.createElement('input'); url.className = 'bm-url'; url.placeholder = 'https://…'; url.value = bm.url || ''; url.style.flex = '2 1 0';
+    const fld = document.createElement('input'); fld.className = 'bm-fld'; fld.placeholder = 'Folder'; fld.value = bm.folder || ''; fld.style.flex = '0 0 110px';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.append(tt, url, fld, del);
+    bmRows.appendChild(row);
+  }
+  document.getElementById('addbm').onclick = () => addBmRow();
+  // Privacy: keep-signed-in allowlist + clear-now.
+  const pvRows = document.getElementById('pvrows');
+  function addPvRow(domain) {
+    const row = document.createElement('div'); row.className = 'lrow';
+    const d = document.createElement('input'); d.className = 'pv-d'; d.placeholder = 'google.com'; d.value = domain || ''; d.style.flex = '1 1 auto';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.append(d, del);
+    pvRows.appendChild(row);
+  }
+  document.getElementById('addpv').onclick = () => addPvRow('');
+  document.getElementById('pvClear').addEventListener('change', (e) => {
+    document.getElementById('pv-allow-wrap').classList.toggle('collapsed', !e.target.checked);
+  });
+  // Trail: excluded-sites editor + master toggle + clear-now.
+  const trRows = document.getElementById('trrows');
+  function addTrRow(domain) {
+    const row = document.createElement('div'); row.className = 'lrow';
+    const d = document.createElement('input'); d.className = 'tr-d'; d.placeholder = 'bank.com'; d.value = domain || ''; d.style.flex = '1 1 auto';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.append(d, del);
+    trRows.appendChild(row);
+  }
+  document.getElementById('addtr').onclick = () => addTrRow('');
+  document.getElementById('trOn').addEventListener('change', (e) => {
+    document.getElementById('tr-body').classList.toggle('collapsed', !e.target.checked);
+    document.getElementById('tr-exclude').classList.toggle('collapsed', !e.target.checked);
+  });
+  document.getElementById('setArchive').addEventListener('change', (e) => {
+    document.getElementById('arch-body').classList.toggle('collapsed', !e.target.checked);
+  });
+  // Link routing (Air Traffic Control) rule editor.
+  const atcRows = document.getElementById('atcrows');
+  function addAtcRow(rule) {
+    rule = rule || {};
+    const row = document.createElement('div'); row.className = 'lrow';
+    const d = document.createElement('input'); d.className = 'atc-d'; d.placeholder = 'github.com'; d.value = rule.pattern || ''; d.style.flex = '1 1 auto';
+    const sel = document.createElement('select'); sel.className = 'atc-ws'; sel.style.flex = '0 0 140px';
+    wsList.forEach(w => {
+      const o = document.createElement('option'); o.value = w.id; o.textContent = wsName(w);
+      if (rule.workspace === w.id) o.selected = true;
+      sel.appendChild(o);
+    });
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.append(d, sel, del);
+    atcRows.appendChild(row);
+  }
+  document.getElementById('addatc').onclick = () => addAtcRow();
+  document.getElementById('trclear').onclick = () => {
+    send({ cmd: 'trail_clear' });
+    const m = document.getElementById('trclear-msg'); m.textContent = 'Cleared.';
+    setTimeout(() => { m.textContent = ''; }, 4000);
+  };
+  document.getElementById('clearck').onclick = () => {
+    send({ cmd: 'clear_cookies' });
+    const m = document.getElementById('clearck-msg'); m.textContent = 'Cleared. Reload open tabs to see it.';
+    setTimeout(() => { m.textContent = ''; }, 4000);
+  };
+  // Profiles: Chrome-style separate identities. The host relaunches into the picked profile.
+  let profList = ['Default'], profCurrent = 'Default', profAsk = false;
+  const profRows = document.getElementById('profrows');
+  function renderProfiles() {
+    profRows.innerHTML = '';
+    profList.forEach(name => {
+      const row = document.createElement('div'); row.className = 'lrow';
+      const lbl = document.createElement('span'); lbl.textContent = name; lbl.style.flex = '1 1 auto';
+      row.appendChild(lbl);
+      if (name === profCurrent) {
+        const cur = document.createElement('span'); cur.textContent = 'current';
+        cur.style.cssText = 'color:var(--fg-dim);font-size:11px';
+        row.appendChild(cur);
+      } else {
+        const sw = document.createElement('button'); sw.textContent = 'Switch';
+        sw.onclick = () => send({ cmd: 'profile_switch', name });
+        row.appendChild(sw);
+        if (name !== 'Default') {
+          // Deleting wipes that profile's logins/history, so require a second click.
+          const del = document.createElement('button'); del.className = 'del'; del.textContent = '×';
+          del.title = 'Delete profile (removes its logins, history, and settings)';
+          del.onclick = () => {
+            if (del.dataset.arm) { send({ cmd: 'profile_delete', name }); }
+            else { del.dataset.arm = '1'; del.textContent = 'Sure?'; setTimeout(() => { delete del.dataset.arm; del.textContent = '×'; }, 3000); }
+          };
+          row.appendChild(del);
+        }
+      }
+      profRows.appendChild(row);
+    });
+    document.getElementById('profask').checked = profAsk;
+  }
+  document.getElementById('profadd').onclick = () => {
+    const name = document.getElementById('profnew').value.trim();
+    if (name) send({ cmd: 'profile_create', name });
+  };
+  document.getElementById('profask').addEventListener('change', (e) => {
+    profAsk = e.target.checked;
+    send({ cmd: 'profiles_ask', on: profAsk });
+  });
+  // Startup picker (shown when "ask at every launch" is on and several profiles exist).
+  const profPick = document.getElementById('profpick');
+  function hideProfilePicker() { profPick.classList.remove('show'); setOverlay('ppick', false); }
+  document.getElementById('profpickclose').onclick = hideProfilePicker;
+  // Default browser: the host registers Aperture in HKCU, then Windows Settings opens for the
+  // user to pick it (Windows does not let apps switch the default themselves).
+  document.getElementById('defbrowser').onclick = () => {
+    send({ cmd: 'set_default_browser' });
+    document.getElementById('defbrowser-msg').textContent = 'Registering…';
+  };
+  // Backup: export to a JSON file (host writes to Downloads); import via a file picker -> host applies.
+  document.getElementById('exportbtn').onclick = () => send({ cmd: 'export_data' });
+  document.getElementById('importbtn').onclick = () => document.getElementById('importfile').click();
+  document.getElementById('importfile').onchange = (e) => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { send({ cmd: 'import_data', data: String(r.result || '') }); e.target.value = ''; };
+    r.readAsText(f);
+  };
+  document.getElementById('setcancel').onclick = () => {
+    if (savedTheme) applyChromeTheme(savedTheme); // discard any live preview
+    kbSetCapture(null);
+    send({ cmd: 'close_settings' });
+  };
+  document.getElementById('setsave').onclick = () => {
+    let search = document.getElementById('setSearch').value.trim();
+    if (search.indexOf('{q}') === -1) search = 'https://duckduckgo.com/?q={q}';
+    const idle = Math.max(10, parseInt(document.getElementById('setIdle').value, 10) || 300);
+    const ai = {
+      enabled: document.getElementById('aiEnabled').checked,
+      model: document.getElementById('aiModel').value || aiCurrentModel,
+      host: document.getElementById('aiHost').value.trim() || 'http://127.0.0.1:11434',
+      keep_alive: document.getElementById('aiKeep').value.trim() || '5m',
+      unload_on_close: document.getElementById('aiUnload').checked,
+      selection_pill: document.getElementById('aiPill').checked,
+      omnibox_ask: document.getElementById('aiOmni').checked,
+      web_search: document.getElementById('aiWeb').checked,
+      vision: document.getElementById('aiVision').checked,
+      web_results: Math.max(1, Math.min(5, parseInt(document.getElementById('aiWebN').value, 10) || 3)),
+      translate_to: document.getElementById('aiTranslate').value.trim() || 'English',
+    };
+    const engines = [];
+    engRows.querySelectorAll('.lrow').forEach(r => {
+      const keyword = r.querySelector('.eng-kw').value.trim();
+      const name = r.querySelector('.eng-nm').value.trim();
+      let u = r.querySelector('.eng-url').value.trim();
+      if (!keyword || !u) return;
+      if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+      engines.push({ keyword, name, url: u });
+    });
+    const keepLoggedIn = [];
+    pvRows.querySelectorAll('.lrow').forEach(r => { const d = r.querySelector('.pv-d').value.trim(); if (d) keepLoggedIn.push(d); });
+    const trailExclude = [];
+    trRows.querySelectorAll('.lrow').forEach(r => { const d = r.querySelector('.tr-d').value.trim(); if (d) trailExclude.push(d); });
+    const atcRules = [];
+    atcRows.querySelectorAll('.lrow').forEach(r => {
+      const pattern = r.querySelector('.atc-d').value.trim();
+      const ws = parseInt(r.querySelector('.atc-ws').value, 10);
+      if (pattern && !isNaN(ws)) atcRules.push({ pattern, workspace: ws });
+    });
+    const trailDaysV = Math.max(1, Math.min(30, parseInt(document.getElementById('trDays').value, 10) || 7));
+    const trail = {
+      enabled: document.getElementById('trOn').checked,
+      graph_days: trailDaysV,
+      retention_days: Math.max(trailDaysV, Math.min(365, parseInt(document.getElementById('trKeep').value, 10) || 30)),
+      exclude: trailExclude,
+    };
+    const prefs = { name: document.getElementById('setName').value.trim(), search_url: search, idle_secs: idle, ai, theme: themeFromInputs(), search_engines: engines, clear_other_on_launch: document.getElementById('pvClear').checked, keep_logged_in: keepLoggedIn, vertical_tabs: document.getElementById('setVertical').checked, shortcuts: kbOverrides, trail,
+      archive_enabled: document.getElementById('setArchive').checked,
+      archive_days: Math.max(1, Math.min(365, parseInt(document.getElementById('setArchiveDays').value, 10) || 14)),
+      atc_rules: atcRules };
+    kbSetCapture(null);
+    send({ cmd: 'save_settings', prefs });
+    // The full settings page always shows the shortcut editor, so it's always safe to save links.
+    const links = [];
+    linkRows.querySelectorAll('.lrow').forEach(r => {
+      const icon = r.querySelector('select').value;
+      const label = r.querySelector('.lbl-in').value.trim();
+      let u = r.querySelector('.url-in').value.trim();
+      if (!u) return;
+      if (!/^https?:\/\//i.test(u) && !u.startsWith('about:')) u = 'https://' + u;
+      links.push({ icon, label, url: u });
+    });
+    send({ cmd: 'save_links', links });
+    // Bookmarks (with folders) from the Bookmarks section.
+    const bms = [];
+    bmRows.querySelectorAll('.lrow').forEach(r => {
+      const title = r.querySelector('.bm-tt').value.trim();
+      let u = r.querySelector('.bm-url').value.trim();
+      const folder = r.querySelector('.bm-fld').value.trim();
+      if (!u) return;
+      if (!/^https?:\/\//i.test(u) && !u.startsWith('about:')) u = 'https://' + u;
+      bms.push({ title, url: u, folder: folder || null });
+    });
+    send({ cmd: 'save_bookmarks', bookmarks: bms });
+  };
+  // Keyboard shortcuts editor. KB_ACTIONS mirrors main.rs SHORTCUT_ACTIONS - keep them in sync.
+  // kbOverrides holds only the bindings that differ from the default; that's what gets saved.
+  const KB_ACTIONS = [
+    ['new_tab', 'New tab', 'ctrl+t'],
+    ['reopen_tab', 'Reopen closed tab', 'ctrl+shift+t'],
+    ['new_private_tab', 'New private tab', 'ctrl+shift+n'],
+    ['close_tab', 'Close tab', 'ctrl+w'],
+    ['next_tab', 'Next tab', 'ctrl+tab'],
+    ['prev_tab', 'Previous tab', 'ctrl+shift+tab'],
+    ['back', 'Back', 'alt+left'],
+    ['forward', 'Forward', 'alt+right'],
+    ['reload', 'Reload page', 'ctrl+r'],
+    ['hard_reload', 'Hard reload (bypass cache)', 'ctrl+shift+r'],
+    ['focus_omnibox', 'Focus address bar', 'ctrl+l'],
+    ['bookmark', 'Bookmark this page', 'ctrl+d'],
+    ['find', 'Find in page', 'ctrl+f'],
+    ['history', 'History', 'ctrl+h'],
+    ['palette', 'Command palette', 'ctrl+k'],
+    ['ai_panel', 'AI sidebar', 'alt+g'],
+    ['split', 'Split view', 'ctrl+\\'],
+    ['print', 'Print', 'ctrl+p'],
+    ['zoom_in', 'Zoom in', 'ctrl+='],
+    ['zoom_out', 'Zoom out', 'ctrl+-'],
+    ['zoom_reset', 'Reset zoom', 'ctrl+0'],
+  ];
+  let kbOverrides = {}, kbCapture = null;
+  // The host must know when we're recording: it suppresses the pressed combo's current action so
+  // the keydown reaches this page instead of, say, opening a new tab.
+  function kbSetCapture(id) { kbCapture = id; send({ cmd: 'kb_capture', on: !!id }); }
+  function kbMsg(t) { document.getElementById('kbmsg').textContent = t || ''; }
+  function kbBinding(id, def) { return kbOverrides[id] || def; }
+  function kbFmt(spec) {
+    const NAMES = { ctrl: 'Ctrl', shift: 'Shift', alt: 'Alt', left: '←', right: '→', up: '↑', down: '↓',
+                    tab: 'Tab', space: 'Space', enter: 'Enter', backspace: 'Backspace', delete: 'Del', insert: 'Ins',
+                    home: 'Home', end: 'End', pageup: 'PgUp', pagedown: 'PgDn' };
+    return spec.split('+').map(p => NAMES[p] || p.toUpperCase()).join(' + ');
+  }
+  function renderKb() {
+    const wrap = document.getElementById('kbrows');
+    wrap.innerHTML = '';
+    KB_ACTIONS.forEach(([id, label, def]) => {
+      const row = document.createElement('div'); row.className = 'kbrow';
+      const l = document.createElement('span'); l.className = 'kbl'; l.textContent = label;
+      const key = document.createElement('button'); key.type = 'button';
+      key.className = 'kbkey' + (kbCapture === id ? ' capturing' : '') + (kbOverrides[id] ? ' overridden' : '');
+      key.textContent = kbCapture === id ? 'Press keys…' : kbFmt(kbBinding(id, def));
+      key.onclick = (e) => { e.stopPropagation(); kbSetCapture(kbCapture === id ? null : id); kbMsg(''); renderKb(); };
+      row.appendChild(l); row.appendChild(key);
+      if (kbOverrides[id]) {
+        const u = document.createElement('button'); u.type = 'button'; u.className = 'kbundo';
+        u.textContent = '↺'; u.title = 'Reset to ' + kbFmt(def);
+        u.onclick = (e) => { e.stopPropagation(); delete kbOverrides[id]; kbMsg(''); renderKb(); };
+        row.appendChild(u);
+      }
+      wrap.appendChild(row);
+    });
+  }
+  // Physical-key name from KeyboardEvent.code (layout independent, matches the host's VK table).
+  function kbKeyName(e) {
+    const c = e.code;
+    if (/^Key[A-Z]$/.test(c)) return c.slice(3).toLowerCase();
+    if (/^Digit[0-9]$/.test(c)) return c.slice(5);
+    if (/^F([1-9]|1[0-2])$/.test(c)) return c.toLowerCase();
+    return ({ Equal: '=', Minus: '-', Comma: ',', Period: '.', Slash: '/', Semicolon: ';', Quote: "'",
+              BracketLeft: '[', BracketRight: ']', Backslash: '\\', Backquote: '`', Tab: 'tab', Space: 'space',
+              Enter: 'enter', Backspace: 'backspace', Delete: 'delete', Insert: 'insert', Home: 'home', End: 'end',
+              PageUp: 'pageup', PageDown: 'pagedown', ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up',
+              ArrowDown: 'down' })[c] || null;
+  }
+  document.addEventListener('keydown', (e) => {
+    if (!kbCapture) return;
+    e.preventDefault(); e.stopPropagation();
+    if (e.key === 'Escape') { kbSetCapture(null); kbMsg(''); renderKb(); return; }
+    if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return; // modifier alone: keep waiting
+    const k = kbKeyName(e);
+    if (!k) { kbMsg("That key can't be bound."); return; }
+    if (!e.ctrlKey && !e.altKey) { kbMsg('Include Ctrl or Alt in the combination.'); return; }
+    const spec = (e.ctrlKey ? 'ctrl+' : '') + (e.shiftKey ? 'shift+' : '') + (e.altKey ? 'alt+' : '') + k;
+    const clash = KB_ACTIONS.find(([id2, , def2]) => id2 !== kbCapture && kbBinding(id2, def2) === spec);
+    if (clash) { kbMsg('Already used by "' + clash[1] + '".'); return; }
+    const def = KB_ACTIONS.find(([id2]) => id2 === kbCapture)[2];
+    if (spec === def) delete kbOverrides[kbCapture]; else kbOverrides[kbCapture] = spec;
+    kbSetCapture(null); kbMsg(''); renderKb();
+  }, true);
+  document.getElementById('kbresetall').onclick = () => { kbOverrides = {}; kbSetCapture(null); kbMsg(''); renderKb(); };
+
+  // Section nav: each nav item shows only its own section (separate views, not one scroll).
+  function settingsSelectSection(secId) {
+    document.querySelectorAll('.settings-nav a').forEach(a => a.classList.toggle('on', a.dataset.sec === secId));
+    document.querySelectorAll('.settings-content section').forEach(s => s.classList.toggle('active', s.id === secId));
+    const c = document.getElementById('settings-content');
+    if (c) c.scrollTop = 0;
+  }
+  document.querySelectorAll('.settings-nav a').forEach(a => {
+    a.addEventListener('click', () => settingsSelectSection(a.dataset.sec));
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && settingsModal.classList.contains('show')) send({ cmd: 'close_settings' });
+  });
+
+  // Save-to-Bitwarden prompt (shown after a login submit; master password unlocks the vault to write).
+  const saveModal = document.getElementById('savemodal');
+  const savePass = document.getElementById('savepass');
+  const saveSub = document.getElementById('savesub');
+  const saveStatus = document.getElementById('savestatus');
+  function submitSave() {
+    const v = savePass.value;
+    if (!v) return;
+    saveStatus.textContent = 'Saving…';
+    send({ cmd: 'bw_save_submit', password: v });
+    savePass.value = '';
+  }
+  document.getElementById('savebtn').onclick = submitSave;
+  document.getElementById('savecancel').onclick = () => send({ cmd: 'bw_save_cancel' });
+  savePass.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitSave();
+    if (e.key === 'Escape') send({ cmd: 'bw_save_cancel' });
+  });
+
+  // Memory HUD: how many tabs are currently asleep/discarded (Aperture's headline feature, made visible).
+  function updateHud(tabs) {
+    const n = (tabs || []).filter(t => t.napping).length;
+    const hud = document.getElementById('hud');
+    if (n > 0) {
+      hud.style.display = '';
+      hud.querySelector('.n').textContent = n;
+      hud.title = n + ' tab' + (n > 1 ? 's' : '') + ' asleep · ~' + (n * 85) + ' MB freed (estimate)';
+    } else {
+      hud.style.display = 'none';
+    }
+  }
+  const memPop = document.getElementById('mempop');
+  const memList = document.getElementById('memlist');
+  function renderMemory(tabs) {
+    memList.innerHTML = '';
+    (tabs || []).forEach(t => {
+      const state = t.active ? 'active' : t.discarded ? 'unloaded' : t.suspended ? 'sleeping' : t.pinned ? 'kept loaded' : 'awake';
+      const row = document.createElement('div'); row.className = 'mem-item';
+      const dot = document.createElement('span'); dot.className = 'mem-dot ' + (t.discarded ? 'drop' : t.suspended ? 'sleep' : 'awake');
+      const main = document.createElement('div'); main.className = 'mem-main';
+      const title = document.createElement('div'); title.className = 'mem-title'; title.textContent = t.title || displayUrl(t.url) || 'New Tab';
+      const sub = document.createElement('div'); sub.className = 'mem-state'; sub.textContent = state + (t.audio ? ' · audio' : '') + (t.pinned ? ' · pinned' : '');
+      main.appendChild(title); main.appendChild(sub); row.appendChild(dot); row.appendChild(main);
+      row.onclick = () => { memPop.classList.remove('show'); setOverlay('mem', false); send({ cmd: 'switch_tab', id: t.id }); };
+      memList.appendChild(row);
+    });
+  }
+  document.getElementById('hud').onclick = (e) => {
+    e.stopPropagation();
+    renderMemory(lastTabs);
+    memPop.classList.toggle('show'); setOverlay('mem', memPop.classList.contains('show'));
+  };
+  document.addEventListener('click', (e) => {
+    if (memPop.classList.contains('show') && !memPop.contains(e.target)) { memPop.classList.remove('show'); setOverlay('mem', false); }
+  });
+
+  // Find-in-page bar (Ctrl+F). The host highlights matches on the active tab and reports count/index.
+  const findbar = document.getElementById('findbar');
+  const findq = document.getElementById('findq');
+  const findcount = document.getElementById('findcount');
+  function doFind(forward) { const q = findq.value; if (q) { send({ cmd: 'find', q, forward }); } else { findcount.textContent = ''; send({ cmd: 'find_clear' }); } }
+  function closeFind() { findbar.classList.remove('show'); findcount.textContent = ''; send({ cmd: 'find_clear' }); }
+  document.getElementById('findnext').onclick = () => doFind(true);
+  document.getElementById('findprev').onclick = () => doFind(false);
+  document.getElementById('findclose').onclick = closeFind;
+  findq.addEventListener('input', () => doFind(true));
+  findq.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doFind(!e.shiftKey); }
+    if (e.key === 'Escape') closeFind();
+  });
+
+  // Command palette (Ctrl+K): jump to open tabs / bookmarks / actions.
+  let lastTabs = [], lastBookmarks = [], palItems = [], palSel = 0;
+  const palette = document.getElementById('palette');
+  const palq = document.getElementById('palq');
+  const pallist = document.getElementById('pallist');
+  function palBuild(filter) {
+    filter = (filter || '').toLowerCase();
+    const items = [];
+    lastTabs.forEach(t => items.push({ k: 'tab', label: t.title || 'New Tab', cmd: { cmd: 'switch_tab', id: t.id } }));
+    lastBookmarks.forEach(b => items.push({ k: 'mark', label: b.title || b.url, cmd: { cmd: 'bookmark_open', url: b.url } }));
+    [['New tab', { cmd: 'new_tab' }], ['New private tab', { cmd: 'new_private_tab' }], ['Reader mode', { cmd: 'reader' }], ['Translate page', { cmd: 'translate_page' }], ['Organize tabs (AI)', { cmd: 'organize_tabs' }], ['Screenshot page', { cmd: 'screenshot' }], ['Split view', { cmd: 'split_view' }], ['History', { cmd: 'open_history' }], ['Settings', { cmd: 'open_settings' }], ['Reload', { cmd: 'reload' }]]
+      .forEach(([l, c]) => items.push({ k: 'go', label: l, cmd: c }));
+    return items.filter(it => it.label.toLowerCase().includes(filter));
+  }
+  function palRender() {
+    pallist.innerHTML = '';
+    palItems.forEach((it, i) => {
+      const d = document.createElement('div'); d.className = 'pal-item' + (i === palSel ? ' sel' : '');
+      const k = document.createElement('span'); k.className = 'k'; k.textContent = it.k;
+      const t = document.createElement('span'); t.className = 't'; t.textContent = it.label;
+      d.appendChild(k); d.appendChild(t);
+      d.onclick = () => palActivate(i);
+      pallist.appendChild(d);
+    });
+  }
+  // Close the palette FIRST, then run the action: actions that open another full-window overlay
+  // (History/Settings) must win the final chrome-bounds state, so they fire after the palette shrink.
+  function palActivate(i) { const it = palItems[i]; if (!it) return; send({ cmd: 'close_palette' }); send(it.cmd); }
+  palq.addEventListener('input', () => { palItems = palBuild(palq.value); palSel = 0; palRender(); });
+  palq.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); palSel = Math.min(palSel + 1, palItems.length - 1); palRender(); pallist.children[palSel] && pallist.children[palSel].scrollIntoView({ block: 'nearest' }); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); palSel = Math.max(palSel - 1, 0); palRender(); pallist.children[palSel] && pallist.children[palSel].scrollIntoView({ block: 'nearest' }); }
+    else if (e.key === 'Enter') { e.preventDefault(); palActivate(palSel); }
+    else if (e.key === 'Escape') { send({ cmd: 'close_palette' }); }
+  });
+
+  // Downloads popover: a toolbar button (hidden until the first download) + a list with status.
+  const dlBtn = document.getElementById('dl');
+  const dlCount = document.getElementById('dlcount');
+  const dlPop = document.getElementById('dlpop');
+  const dlList = document.getElementById('dllist');
+  const DL_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+  const DL_FAIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+  const DL_BUSY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/></svg>';
+  let lastDownloads = [];
+  function renderDownloads() {
+    const active = lastDownloads.filter(d => d.state === 0).length;
+    dlBtn.style.display = lastDownloads.length ? '' : 'none';
+    dlBtn.classList.toggle('busy', active > 0);
+    dlCount.textContent = active || '';
+    dlCount.classList.toggle('show', active > 0);
+    dlList.innerHTML = '';
+    if (!lastDownloads.length) {
+      const e = document.createElement('div'); e.className = 'dl-empty'; e.textContent = 'No downloads yet.';
+      dlList.appendChild(e); return;
+    }
+    lastDownloads.forEach(d => {
+      const row = document.createElement('div');
+      row.className = 'dl-item' + (d.state === 1 ? ' done' : d.state === 2 ? ' fail' : '');
+      const ic = document.createElement('span'); ic.className = 'ic';
+      ic.innerHTML = d.state === 1 ? DL_DONE : d.state === 2 ? DL_FAIL : DL_BUSY;
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = d.name; nm.title = d.path || d.name;
+      const st = document.createElement('div'); st.className = 'st';
+      st.textContent = d.state === 1 ? 'Completed' : d.state === 2 ? 'Failed' : 'Downloading…';
+      meta.appendChild(nm); meta.appendChild(st);
+      row.appendChild(ic); row.appendChild(meta);
+      if (d.state === 1 && d.path) { row.onclick = () => send({ cmd: 'open_download', path: d.path }); }
+      dlList.appendChild(row);
+    });
+  }
+  dlBtn.onclick = (e) => { e.stopPropagation(); dlPop.classList.toggle('show'); setOverlay('dl', dlPop.classList.contains('show')); };
+
+  // Proactive download feedback: a transient pill shown when a download starts (the toolbar button also
+  // pulses while any download runs). Clicking it opens the downloads list. Auto-dismisses.
+  const dlToast = document.getElementById('dltoast');
+  let dlToastTimer = null;
+  dlToast.onclick = () => { dlToast.classList.remove('show'); if (!dlPop.classList.contains('show')) dlBtn.click(); };
+  function showDownloadToast(name) {
+    dlToast.innerHTML = '';
+    const dot = document.createElement('span'); dot.className = 'dot';
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = 'Downloading ' + (name || 'file') + '…';
+    dlToast.appendChild(dot); dlToast.appendChild(nm);
+    dlToast.classList.add('show');
+    if (dlToastTimer) clearTimeout(dlToastTimer);
+    dlToastTimer = setTimeout(() => dlToast.classList.remove('show'), 5000);
+  }
+
+  // Reading list popover.
+  const rlPop = document.getElementById('rlpop');
+  const rlBtn = document.getElementById('rl-btn');
+  let lastReading = [];
+  function renderReading() {
+    rlPop.innerHTML = '';
+    const head = document.createElement('div'); head.className = 'rlpop-head';
+    const add = document.createElement('button'); add.textContent = '+ Add this page';
+    add.onclick = (e) => { e.stopPropagation(); send({ cmd: 'reading_add' }); };
+    head.appendChild(add); rlPop.appendChild(head);
+    if (!lastReading.length) { const em = document.createElement('div'); em.className = 'rl-empty'; em.textContent = 'No saved pages yet'; rlPop.appendChild(em); }
+    lastReading.forEach(it => {
+      const row = document.createElement('div'); row.className = 'rl-item';
+      const t = document.createElement('div'); t.className = 'rl-t'; t.textContent = it.title || it.url; t.title = it.url;
+      t.onclick = () => { send({ cmd: 'reading_open', url: it.url }); rlPop.classList.remove('show'); setOverlay('rl', false); };
+      const x = document.createElement('button'); x.className = 'rl-x'; x.textContent = '×'; x.title = 'Remove';
+      x.onclick = (e) => { e.stopPropagation(); send({ cmd: 'reading_remove', url: it.url }); };
+      row.appendChild(t); row.appendChild(x); rlPop.appendChild(row);
+    });
+  }
+  rlBtn.onclick = (e) => { e.stopPropagation(); renderReading(); rlPop.classList.toggle('show'); setOverlay('rl', rlPop.classList.contains('show')); };
+  document.addEventListener('click', (e) => {
+    if (rlPop.classList.contains('show') && !rlPop.contains(e.target) && e.target !== rlBtn && !rlBtn.contains(e.target)) { rlPop.classList.remove('show'); setOverlay('rl', false); }
+  });
+  document.getElementById('dlclear').onclick = (e) => { e.stopPropagation(); send({ cmd: 'clear_downloads' }); };
+  document.addEventListener('click', (e) => {
+    if (dlPop.classList.contains('show') && !dlPop.contains(e.target) && e.target !== dlBtn && !dlBtn.contains(e.target)) { dlPop.classList.remove('show'); setOverlay('dl', false); }
+  });
+
+  // History viewer (Ctrl+H): full-window overlay with search + delete, seeded by the host.
+  // Two sources behind one list: browsing history, and tabs the auto-archiver closed.
+  let lastHistory = [], lastArchive = [], histMode = 'h';
+  const histPanel = document.getElementById('history');
+  const histq = document.getElementById('histq');
+  const histlist = document.getElementById('histlist');
+  function renderHistory() {
+    const f = histq.value.trim().toLowerCase();
+    const src = histMode === 'a' ? lastArchive : lastHistory;
+    const items = src.filter(h => !f || (h.title || '').toLowerCase().includes(f) || (h.url || '').toLowerCase().includes(f));
+    histlist.innerHTML = '';
+    if (!items.length) {
+      const e = document.createElement('div'); e.className = 'hist-empty';
+      e.textContent = histMode === 'a'
+        ? (src.length ? 'No matching archived tabs.' : 'Nothing archived yet.')
+        : (src.length ? 'No matching history.' : 'No history yet.');
+      histlist.appendChild(e); return;
+    }
+    items.forEach(h => {
+      const row = document.createElement('div'); row.className = 'hist-item';
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const t = document.createElement('div'); t.className = 'ht'; t.textContent = h.title || h.url;
+      const u = document.createElement('div'); u.className = 'hu';
+      u.textContent = h.url + (histMode === 'a' && h.ts ? ' · archived ' + new Date(h.ts * 1000).toLocaleDateString() : '');
+      meta.appendChild(t); meta.appendChild(u);
+      const x = document.createElement('div'); x.className = 'hx'; x.textContent = '×'; x.title = 'Remove';
+      x.onclick = (e) => { e.stopPropagation(); send({ cmd: histMode === 'a' ? 'archive_delete' : 'history_delete', url: h.url }); };
+      row.onclick = () => {
+        if (histMode === 'a') { send({ cmd: 'archive_open', url: h.url }); closeHistoryAnimated(); }
+        else send({ cmd: 'history_open', url: h.url });
+      };
+      row.appendChild(meta); row.appendChild(x);
+      histlist.appendChild(row);
+    });
+  }
+  function histSetMode(m) {
+    histMode = m;
+    document.getElementById('histmh').classList.toggle('on', m === 'h');
+    document.getElementById('histma').classList.toggle('on', m === 'a');
+    histq.placeholder = m === 'a' ? 'Search archived tabs…' : 'Search history…';
+    document.getElementById('histclear').title = m === 'a' ? 'Clear the archive' : 'Clear all history';
+    renderHistory();
+  }
+  document.getElementById('histmh').onclick = () => histSetMode('h');
+  document.getElementById('histma').onclick = () => histSetMode('a');
+  histq.addEventListener('input', renderHistory);
+  // Close = fade out first, then tell the host to shrink the chrome (close_history). Every close
+  // path routes through this so open and close are symmetric.
+  let histClosing = false;
+  function closeHistoryAnimated() {
+    if (histClosing) return;
+    if (!histPanel.classList.contains('show')) { send({ cmd: 'close_history' }); return; }
+    histClosing = true;
+    histPanel.classList.add('closing');
+    setTimeout(() => send({ cmd: 'close_history' }), 140);
+  }
+  histq.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHistoryAnimated(); });
+  document.getElementById('histclose').onclick = () => closeHistoryAnimated();
+  document.getElementById('histclear').onclick = () => send({ cmd: histMode === 'a' ? 'archive_clear' : 'history_clear' });
+
+  window.__chrome = {
+    setUrl(url)           { currentUrl = url; if (document.activeElement !== addr) addr.value = url; },
+    setOmniboxComplete(typed, completion) {
+      if (document.activeElement !== addr || omniDeleting) return;
+      if (addr.value !== typed) return;
+      const c = String(completion);
+      if (c.length <= typed.length || c.toLowerCase().indexOf(typed.toLowerCase()) !== 0) return;
+      addr.value = c;
+      addr.setSelectionRange(typed.length, c.length);
+    },
+    setLoading(isLoading) { bar.classList.toggle('loading', !!isLoading); loadbar.classList.toggle('show', !!isLoading); },
+    setCanGo(b, f)        { back.disabled = !b; fwd.disabled = !f; },
+    setZoom(pct)          { zoomChip.textContent = pct + '%'; zoomChip.style.display = (pct === 100) ? 'none' : ''; },
+    setFind(r)            { r = r || {}; const c = r.count || 0; findcount.textContent = c ? (r.index + '/' + c) : (findq.value ? 'No results' : ''); },
+    setTabs(tabs)         { lastTabs = tabs || []; renderTabs(tabs); updateHud(tabs); renderMemory(tabs); },
+    setGroups(list)       { lastGroups = list || []; renderTabs(lastTabs); },
+    setWorkspaces(list, active) { wsList = list || []; wsActive = active || 0; renderWs(); renderTabs(lastTabs); },
+    setBookmarks(list)    { lastBookmarks = list || []; renderBookmarksOverflow(list); },
+    setStarred(on)        { const s = document.getElementById('star'); s.classList.toggle('on', !!on); s.title = on ? 'Remove bookmark' : 'Bookmark this page'; },
+    setBookmarkFolders(list) { lastFolders = list || []; renderBookmarksOverflow(lastBookmarks); },
+    showBookmarkAdded(url)   { bmAddedPopup(url); },
+    showPermission(id, host, label) { permQueue.push({ id: id, host: host, label: label }); renderPerm(); },
+    setReading(list)      { lastReading = list || []; renderReading(); },
+    setDownloads(list)    { lastDownloads = list || []; renderDownloads(); },
+    downloadStarted(name) { showDownloadToast(name); },
+    setHistorySource(list){ lastHistory = list || []; },
+    showRestore(show, count) {
+      restoreTxt.textContent = count ? ('Restore ' + count + ' closed tab' + (count === 1 ? '' : 's') + '?') : '';
+      restoreBar.classList.toggle('show', !!show);
+    },
+    showHistory(list)     { lastHistory = list || []; renderHistory(); },
+    setArchive(list)      { lastArchive = list || []; if (histMode === 'a') renderHistory(); },
+    setProfiles(list, current, ask) { profList = list || ['Default']; profCurrent = current || 'Default'; profAsk = !!ask; renderProfiles(); },
+    showProfilePicker() {
+      const g = document.getElementById('profpicklist'); g.innerHTML = '';
+      profList.forEach(name => {
+        const b = document.createElement('button'); b.className = 'btn' + (name === profCurrent ? ' primary' : '');
+        b.textContent = name + (name === profCurrent ? ' (current)' : '');
+        b.onclick = () => { if (name === profCurrent) hideProfilePicker(); else send({ cmd: 'profile_switch', name }); };
+        g.appendChild(b);
+      });
+      setOverlay('ppick', true);
+      profPick.classList.add('show');
+    },
+    defaultBrowserMsg(ok) {
+      document.getElementById('defbrowser-msg').textContent = ok
+        ? 'Registered. In the Windows Settings page that just opened, pick Aperture under "Default apps".'
+        : 'Registration failed. Try again, or check that reg.exe is available.';
+    },
+    openHistory()         { histClosing = false; histPanel.classList.remove('closing'); histPanel.classList.add('show'); histq.value = ''; renderHistory(); setTimeout(() => histq.focus(), 40); },
+    closeHistory()        { histClosing = false; histPanel.classList.remove('show', 'closing'); },
+    closeHistoryAnimated() { closeHistoryAnimated(); },
+    // No-op when the bar already has focus: the host re-asserts focus shortly after a new-tab page
+    // loads (the page load can steal it back), and a blind re-select would wipe in-progress typing.
+    focusOmnibox()        { if (document.activeElement === addr) return; addr.focus(); addr.select(); },
+    toggleFind()          { if (findbar.classList.contains('show')) { closeFind(); } else { findbar.classList.add('show'); setTimeout(() => { findq.select(); findq.focus(); }, 30); } },
+    showPalette()         { palq.value = ''; palItems = palBuild(''); palSel = 0; palRender(); palette.classList.add('show'); setTimeout(() => palq.focus(), 40); },
+    hidePalette()         { palette.classList.remove('show'); },
+    showBw()              { bwModal.classList.add('show'); bwStatus.textContent = ''; bwPass.value = ''; setTimeout(() => bwPass.focus(), 50); },
+    hideBw()              { bwModal.classList.remove('show'); bwPass.value = ''; bwStatus.textContent = ''; },
+    bwMessage(msg)        { bwStatus.textContent = msg; },
+    showSettings(links, prefs, isHome) {
+      prefs = prefs || {};
+      settingsIsHome = isHome !== false;
+      document.getElementById('setName').value = prefs.name || '';
+      document.getElementById('setSearch').value = prefs.search_url || 'https://duckduckgo.com/?q={q}';
+      document.getElementById('setIdle').value = prefs.idle_secs || 300;
+      document.getElementById('setVertical').checked = !!prefs.vertical_tabs;
+      const archOn = prefs.archive_enabled !== false;
+      document.getElementById('setArchive').checked = archOn;
+      document.getElementById('setArchiveDays').value = prefs.archive_days || 14;
+      document.getElementById('arch-body').classList.toggle('collapsed', !archOn);
+      // AI assistant settings (always shown; apply to every page).
+      const ai = prefs.ai || {};
+      const aiOn = ai.enabled !== false;
+      document.getElementById('aiEnabled').checked = aiOn;
+      aiCurrentModel = ai.model || '';
+      renderAiModels([]); // shows the saved model now; setAiModels fills the rest when it lands
+      document.getElementById('aiHost').value = ai.host || 'http://127.0.0.1:11434';
+      document.getElementById('aiKeep').value = ai.keep_alive || '5m';
+      document.getElementById('aiUnload').checked = ai.unload_on_close !== false;
+      document.getElementById('aiPill').checked = ai.selection_pill !== false;
+      document.getElementById('aiOmni').checked = ai.omnibox_ask !== false;
+      document.getElementById('aiWeb').checked = ai.web_search !== false;
+      document.getElementById('aiVision').checked = ai.vision !== false;
+      document.getElementById('aiWebN').value = ai.web_results || 3;
+      document.getElementById('aiTranslate').value = ai.translate_to || 'English';
+      document.getElementById('ai-body').classList.toggle('collapsed', !aiOn);
+      document.getElementById('ai-webn-wrap').classList.toggle('collapsed', !document.getElementById('aiWeb').checked);
+      savedTheme = prefs.theme || DEFAULT_THEME;
+      setThemeInputs(savedTheme);
+      engRows.innerHTML = '';
+      (prefs.search_engines || []).forEach(addEngRow);
+      bmRows.innerHTML = '';
+      (lastBookmarks || []).forEach(addBmRow);
+      const pvOn = !!prefs.clear_other_on_launch;
+      document.getElementById('pvClear').checked = pvOn;
+      pvRows.innerHTML = '';
+      (prefs.keep_logged_in || []).forEach(addPvRow);
+      document.getElementById('pv-allow-wrap').classList.toggle('collapsed', !pvOn);
+      document.getElementById('clearck-msg').textContent = '';
+      // Trail settings.
+      const tr = prefs.trail || {};
+      const trailOn = tr.enabled !== false;
+      document.getElementById('trOn').checked = trailOn;
+      document.getElementById('trDays').value = tr.graph_days || 7;
+      document.getElementById('trKeep').value = tr.retention_days || 30;
+      trRows.innerHTML = '';
+      (tr.exclude || []).forEach(addTrRow);
+      document.getElementById('tr-body').classList.toggle('collapsed', !trailOn);
+      document.getElementById('tr-exclude').classList.toggle('collapsed', !trailOn);
+      document.getElementById('trclear-msg').textContent = '';
+      // Link-routing rules.
+      atcRows.innerHTML = '';
+      (prefs.atc_rules || []).forEach(addAtcRow);
+      document.getElementById('defbrowser-msg').textContent = '';
+      // Shortcuts apply to the new-tab page; the full settings page always shows + saves them.
+      linkRows.innerHTML = '';
+      (links || []).forEach(addLinkRow);
+      if (!(links || []).length) addLinkRow();
+      kbOverrides = Object.assign({}, prefs.shortcuts || {});
+      kbSetCapture(null); kbMsg(''); renderKb();
+      settingsSelectSection('sec-general');
+      document.getElementById('settings-content').scrollTop = 0;
+      settingsModal.classList.add('show');
+    },
+    hideSettings()        { settingsModal.classList.remove('show'); },
+    showSave(info)        { info = info || {}; saveSub.textContent = (info.username ? info.username + '  ·  ' : '') + (info.site || ''); saveStatus.textContent = ''; savePass.value = ''; saveModal.classList.add('show'); setTimeout(() => savePass.focus(), 50); },
+    hideSave()            { saveModal.classList.remove('show'); savePass.value = ''; saveStatus.textContent = ''; },
+    saveMessage(m)        { saveStatus.textContent = m; },
+    // AI feature flags: show/hide the lens button and gate the omnibox "?" shortcut.
+    setAiConfig(cfg) {
+      cfg = cfg || {};
+      aiEnabledGlobal = cfg.enabled !== false;
+      aiOmniboxGlobal = cfg.omnibox !== false;
+      const btn = document.getElementById('ai-btn');
+      if (btn) btn.style.display = aiEnabledGlobal ? '' : 'none';
+    },
+    setAiModels(list)     { renderAiModels(list); },
+    // Orientation: horizontal top strip (default) vs. vertical left column. The host has already
+    // re-sized this webview's bounds to match; here we just reflow the internal layout.
+    setTabLayout(vertical) { document.body.classList.toggle('vertical', !!vertical); },
+  };
+
+  send({ cmd: 'ready' });
+</script>
+</body>
+</html>

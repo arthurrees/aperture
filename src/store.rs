@@ -501,6 +501,76 @@ pub struct AtcRule {
     pub workspace: u32,
 }
 
+/// Another Aperture device on the tailnet, for "send tab to device" (and, later, sync).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Peer {
+    /// Display label ("Laptop").
+    pub name: String,
+    /// Tailnet address: a MagicDNS name or a 100.x IP. No scheme or port.
+    pub address: String,
+}
+
+/// Cross-device settings. Transport is Tailscale: a small HTTP listener bound to the tailnet
+/// interface, gated by a shared token that must match on every device.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SyncSettings {
+    /// Turn the listener + send-to-device on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// This device's label, shown to peers.
+    #[serde(default)]
+    pub device_name: String,
+    /// Shared secret; a request is accepted only if its token matches. Generated on first use.
+    #[serde(default)]
+    pub token: String,
+    /// Known peer devices.
+    #[serde(default)]
+    pub peers: Vec<Peer>,
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        SyncSettings {
+            enabled: false,
+            device_name: String::new(),
+            token: String::new(),
+            peers: Vec::new(),
+        }
+    }
+}
+
+/// Fixed port for the device-to-device listener (bound to the Tailscale IP only).
+pub const SYNC_PORT: u16 = 8799;
+
+/// Local safe-browsing (phishing/malware) settings. The blocklist is checked locally at
+/// navigation time; only the list is downloaded, never the URLs you visit.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SafetySettings {
+    /// Warn before loading known-malicious sites. On by default (safety-forward).
+    #[serde(default = "df_true")]
+    pub enabled: bool,
+    /// Hosts-format blocklist feed. Downloaded periodically; empty = seed list only.
+    #[serde(default = "df_safety_feed")]
+    pub feed_url: String,
+    /// Unix seconds of the last successful list update (0 = never).
+    #[serde(default)]
+    pub last_updated: u64,
+}
+
+fn df_safety_feed() -> String {
+    "https://urlhaus.abuse.ch/downloads/hostfile/".to_string()
+}
+
+impl Default for SafetySettings {
+    fn default() -> Self {
+        SafetySettings {
+            enabled: true,
+            feed_url: df_safety_feed(),
+            last_updated: 0,
+        }
+    }
+}
+
 /// User preferences edited in the settings panel.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
@@ -553,6 +623,12 @@ pub struct Settings {
     /// Link-routing rules (Air Traffic Control): destination host -> workspace.
     #[serde(default)]
     pub atc_rules: Vec<AtcRule>,
+    /// Cross-device (Tailscale) settings.
+    #[serde(default)]
+    pub sync: SyncSettings,
+    /// Local safe-browsing settings.
+    #[serde(default)]
+    pub safety: SafetySettings,
 }
 
 fn df_archive_days() -> u64 {
@@ -585,6 +661,8 @@ impl Default for Settings {
             archive_enabled: true,
             archive_days: df_archive_days(),
             atc_rules: Vec::new(),
+            sync: SyncSettings::default(),
+            safety: SafetySettings::default(),
         }
     }
 }

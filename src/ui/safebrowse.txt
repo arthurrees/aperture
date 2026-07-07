@@ -1,0 +1,8 @@
+# Aperture safe-browsing seed list.
+# Format: one host per line, or hosts-file style ("0.0.0.0 host"). Lines starting with # are
+# comments. This tiny bundled seed is a floor; the real coverage is downloaded from the feed in
+# Settings > Safety (default: abuse.ch URLhaus). The check is entirely local: the addresses you
+# visit are never sent anywhere, only this list is downloaded.
+#
+# A harmless entry you can use to see the warning page in action (nothing hosted there):
+blocked-test.aperture.invalid

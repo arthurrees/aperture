@@ -466,6 +466,20 @@
   .btn:hover { background: var(--bg); }
   .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
   .btn.primary:hover { background: #3f7ce0; }
+  .btn.danger { color: #e06c6c; border-color: #4a3436; }
+  .btn.danger:hover { background: #2a1f21; }
+
+  /* Safe-browsing warning: a full-window interstitial (chrome grown to cover the page). */
+  #safety.modal { align-items: center; justify-content: center; background: #1a0e0e; }
+  .safety-card { max-width: 560px; padding: 40px; text-align: center; }
+  .safety-icon { color: #e06c6c; margin: 0 auto 18px; width: 56px; height: 56px; }
+  .safety-icon svg { width: 56px; height: 56px; }
+  .safety-title { font-size: 22px; font-weight: 600; color: #f4d6d6; margin-bottom: 12px; }
+  .safety-body { font-size: 13px; line-height: 1.6; color: var(--fg-dim); margin-bottom: 16px; }
+  .safety-url { font-family: var(--mono); font-size: 12px; color: #e0a0a0; background: #241416;
+                border: 1px solid #4a3436; border-radius: 7px; padding: 9px 12px; margin-bottom: 22px;
+                word-break: break-all; user-select: text; }
+  .safety-actions { display: flex; gap: 10px; justify-content: center; }
 
   /* Settings - a full-window page (left section nav + scrollable content), shown when the chrome
      webview fills the window. #settings keeps class="modal" only for the fade-in; the shell fills it. */
@@ -714,6 +728,21 @@
     </div>
   </div>
 
+  <div id="safety" class="modal">
+    <div class="safety-card">
+      <div class="safety-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M10.363 3.591 2.257 17.125a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636-2.871L13.637 3.591a1.914 1.914 0 0 0-3.274 0z"/><path d="M12 16h.01"/></svg>
+      </div>
+      <div class="safety-title">This site may be dangerous</div>
+      <div class="safety-body">This site is on your local safe-browsing list of known phishing or malware hosts. Aperture stopped it before it loaded. The check happened on your machine; nothing about this visit was sent anywhere.</div>
+      <div class="safety-url" id="safety-url"></div>
+      <div class="safety-actions">
+        <button id="safety-back" class="btn primary">Back to safety</button>
+        <button id="safety-go" class="btn danger">Continue anyway</button>
+      </div>
+    </div>
+  </div>
+
   <div id="profpick" class="modal">
     <div class="modal-card">
       <div class="modal-head">
@@ -755,9 +784,11 @@
         <a data-sec="sec-search">Search</a>
         <a data-sec="sec-ai">AI assistant</a>
         <a data-sec="sec-privacy">Privacy</a>
+        <a data-sec="sec-safety">Safety</a>
         <a data-sec="sec-trail">Trail</a>
         <a data-sec="sec-routing">Routing</a>
         <a data-sec="sec-profiles">Profiles</a>
+        <a data-sec="sec-devices">Devices</a>
         <a data-sec="sec-appearance">Appearance</a>
         <a data-sec="sec-bookmarks">Bookmarks</a>
         <a data-sec="sec-shortcuts">Shortcuts</a>
@@ -858,6 +889,17 @@
               <div id="clearck-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px"></div>
             </div>
           </section>
+          <section id="sec-safety">
+            <div class="prefs">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Safe browsing <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(warns before known phishing/malware sites; the check is local, your URLs are never sent out)</em></div>
+              <label class="pref pref-toggle"><span>Warn before dangerous sites</span><input id="sbOn" type="checkbox" /></label>
+              <div id="sb-body" class="ai-collapse">
+                <label class="pref"><span>Blocklist feed</span><input id="sbFeed" type="text" spellcheck="false" placeholder="https://…/hosts" /><em>a hosts-format list; downloaded periodically, not your browsing</em></label>
+                <div class="addrow" style="display:flex;gap:8px;align-items:center"><button id="sbUpdate" type="button">Update list now</button></div>
+                <div id="sb-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px;min-height:14px"></div>
+              </div>
+            </div>
+          </section>
           <section id="sec-trail">
             <div class="prefs">
               <div class="prefs-h" style="border-top:0;padding-top:0">Trail</div>
@@ -896,6 +938,21 @@
               </div>
               <div id="prof-msg" style="font-size:11px;color:var(--fg-dim);margin-top:6px;min-height:14px"></div>
               <label class="pref pref-toggle" style="margin-top:14px"><span>Ask which profile to open at launch</span><input id="profask" type="checkbox" /></label>
+            </div>
+          </section>
+          <section id="sec-devices">
+            <div class="prefs">
+              <div class="prefs-h" style="border-top:0;padding-top:0">Devices <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(send tabs between your machines over Tailscale; needs Tailscale running on both)</em></div>
+              <label class="pref pref-toggle"><span>Enable device sharing</span><input id="syncOn" type="checkbox" /></label>
+              <div id="sync-body" class="ai-collapse">
+                <label class="pref"><span>This device's name</span><input id="syncName" type="text" spellcheck="false" placeholder="e.g. Desktop" /></label>
+                <label class="pref"><span>This device's address</span><input id="syncAddr" type="text" readonly /><em>give this (or its Tailscale name) to your other device</em></label>
+                <label class="pref"><span>Shared token</span><input id="syncToken" type="text" spellcheck="false" /><em>must match on every device; paste the same value on each</em></label>
+                <div class="addrow" style="display:flex;gap:8px"><button id="syncRegen" type="button">Generate new token</button></div>
+                <div class="prefs-h">Paired devices <em style="font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--fg-dim)">(name + Tailscale address or 100.x IP)</em></div>
+                <div id="syncrows"></div>
+                <div class="addrow"><button id="addsync" type="button">+ Add device</button></div>
+              </div>
             </div>
           </section>
           <section id="sec-appearance">
@@ -1395,6 +1452,10 @@
       addMenuItem((t.group != null ? 'Move to ' : 'Add to ') + '“' + (g.name || g.color) + '”', () => send({ cmd: 'group_add', id: t.id, group: g.id }));
     });
     if (t.group != null) addMenuItem('Remove from group', () => send({ cmd: 'group_remove', id: t.id }));
+    if (syncCfg.enabled && (syncCfg.peers || []).length) {
+      addMenuSep();
+      syncCfg.peers.forEach((p, i) => addMenuItem('Send to ' + (p.name || p.address), () => send({ cmd: 'send_tab', peer: i })));
+    }
     if (wsList.length > 1) {
       addMenuSep();
       wsList.filter(w => w.id !== (t.workspace || 0)).forEach(w => {
@@ -1902,6 +1963,49 @@
   const profPick = document.getElementById('profpick');
   function hideProfilePicker() { profPick.classList.remove('show'); setOverlay('ppick', false); }
   document.getElementById('profpickclose').onclick = hideProfilePicker;
+  // Safe-browsing interstitial (chrome grown to cover the page by the host).
+  let safetyLastUpdated = 0; // preserved across a settings save (host owns the real value)
+  const safetyModal = document.getElementById('safety');
+  document.getElementById('safety-back').onclick = () => send({ cmd: 'safety_back' });
+  document.getElementById('safety-go').onclick = () => send({ cmd: 'safety_continue' });
+  // Safe-browsing settings.
+  document.getElementById('sbOn').addEventListener('change', (e) => {
+    document.getElementById('sb-body').classList.toggle('collapsed', !e.target.checked);
+  });
+  document.getElementById('sbUpdate').onclick = () => {
+    send({ cmd: 'safety_update' });
+    document.getElementById('sb-msg').textContent = 'Updating…';
+  };
+  // Devices (Tailscale). syncCfg mirrors the host's sync settings; peers also drive the tab menu.
+  let syncCfg = { enabled: false, device_name: '', token: '', address: '', peers: [] };
+  const syncRows = document.getElementById('syncrows');
+  function addSyncRow(peer) {
+    peer = peer || {};
+    const row = document.createElement('div'); row.className = 'lrow';
+    const nm = document.createElement('input'); nm.className = 'sy-nm'; nm.placeholder = 'Laptop'; nm.value = peer.name || ''; nm.style.flex = '0 0 130px';
+    const ad = document.createElement('input'); ad.className = 'sy-ad'; ad.placeholder = 'tailscale-name or 100.x.y.z'; ad.value = peer.address || ''; ad.style.flex = '1 1 auto';
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '×'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.append(nm, ad, del);
+    syncRows.appendChild(row);
+  }
+  function renderSync() {
+    document.getElementById('syncOn').checked = syncCfg.enabled;
+    document.getElementById('syncName').value = syncCfg.device_name || '';
+    document.getElementById('syncAddr').value = syncCfg.address || 'Tailscale not detected';
+    document.getElementById('syncToken').value = syncCfg.token || '';
+    document.getElementById('sync-body').classList.toggle('collapsed', !syncCfg.enabled);
+    syncRows.innerHTML = '';
+    (syncCfg.peers || []).forEach(addSyncRow);
+  }
+  document.getElementById('syncOn').addEventListener('change', (e) => {
+    document.getElementById('sync-body').classList.toggle('collapsed', !e.target.checked);
+  });
+  document.getElementById('addsync').onclick = () => addSyncRow();
+  document.getElementById('syncRegen').onclick = () => {
+    // Client-side random token; the host also seeds one, but this lets the user roll it.
+    const a = new Uint8Array(16); crypto.getRandomValues(a);
+    document.getElementById('syncToken').value = Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+  };
   // Import from Chrome: the host detects Chrome's profiles when Settings opens; Import runs on a
   // host worker thread and reports back through importMsg.
   let chromeProfiles = [];
@@ -1993,7 +2097,26 @@
     const prefs = { name: document.getElementById('setName').value.trim(), search_url: search, idle_secs: idle, ai, theme: themeFromInputs(), search_engines: engines, clear_other_on_launch: document.getElementById('pvClear').checked, keep_logged_in: keepLoggedIn, vertical_tabs: document.getElementById('setVertical').checked, shortcuts: kbOverrides, trail,
       archive_enabled: document.getElementById('setArchive').checked,
       archive_days: Math.max(1, Math.min(365, parseInt(document.getElementById('setArchiveDays').value, 10) || 14)),
-      atc_rules: atcRules };
+      atc_rules: atcRules,
+      sync: (() => {
+        const peers = [];
+        syncRows.querySelectorAll('.lrow').forEach(r => {
+          const name = r.querySelector('.sy-nm').value.trim();
+          const address = r.querySelector('.sy-ad').value.trim().replace(/^https?:\/\//, '');
+          if (address) peers.push({ name: name || address, address });
+        });
+        return {
+          enabled: document.getElementById('syncOn').checked,
+          device_name: document.getElementById('syncName').value.trim(),
+          token: document.getElementById('syncToken').value.trim(),
+          peers,
+        };
+      })(),
+      safety: {
+        enabled: document.getElementById('sbOn').checked,
+        feed_url: document.getElementById('sbFeed').value.trim(),
+        last_updated: safetyLastUpdated,
+      } };
     kbSetCapture(null);
     send({ cmd: 'save_settings', prefs });
     // The full settings page always shows the shortcut editor, so it's always safe to save links.
@@ -2277,6 +2400,16 @@
     if (dlToastTimer) clearTimeout(dlToastTimer);
     dlToastTimer = setTimeout(() => dlToast.classList.remove('show'), 5000);
   }
+  // Generic transient message, reuses the download-toast pill.
+  function showToast(msg) {
+    dlToast.innerHTML = '';
+    const dot = document.createElement('span'); dot.className = 'dot';
+    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = msg;
+    dlToast.appendChild(dot); dlToast.appendChild(nm);
+    dlToast.classList.add('show');
+    if (dlToastTimer) clearTimeout(dlToastTimer);
+    dlToastTimer = setTimeout(() => dlToast.classList.remove('show'), 4000);
+  }
 
   // Reading list popover.
   const rlPop = document.getElementById('rlpop');
@@ -2402,6 +2535,11 @@
     setProfiles(list, current, ask) { profList = list || ['Default']; profCurrent = current || 'Default'; profAsk = !!ask; renderProfiles(); },
     setChromeProfiles(list) { chromeProfiles = list || []; renderChromeProfiles(); },
     importMsg(m)          { document.getElementById('ci-msg').textContent = m; },
+    setSync(cfg)          { syncCfg = cfg || syncCfg; if (document.getElementById('settings').classList.contains('show')) renderSync(); },
+    toast(m)              { showToast(m); },
+    showSafety(url)       { document.getElementById('safety-url').textContent = url || ''; safetyModal.classList.add('show'); },
+    hideSafety()          { safetyModal.classList.remove('show'); },
+    safetyMsg(m)          { document.getElementById('sb-msg').textContent = m; },
     showProfilePicker() {
       const g = document.getElementById('profpicklist'); g.innerHTML = '';
       profList.forEach(name => {
@@ -2484,6 +2622,19 @@
       // Link-routing rules.
       atcRows.innerHTML = '';
       (prefs.atc_rules || []).forEach(addAtcRow);
+      // The persisted sync settings lack the runtime-detected address; keep the one setSync pushed.
+      if (prefs.sync) { const addr = syncCfg.address; syncCfg = Object.assign({}, prefs.sync, { address: addr }); }
+      renderSync();
+      // Safe browsing.
+      const sb = prefs.safety || {};
+      const sbEnabled = sb.enabled !== false;
+      safetyLastUpdated = sb.last_updated || 0;
+      document.getElementById('sbOn').checked = sbEnabled;
+      document.getElementById('sbFeed').value = sb.feed_url || '';
+      document.getElementById('sb-body').classList.toggle('collapsed', !sbEnabled);
+      document.getElementById('sb-msg').textContent = sb.last_updated
+        ? 'List last updated ' + new Date(sb.last_updated * 1000).toLocaleDateString() + '.'
+        : 'List not downloaded yet.';
       document.getElementById('defbrowser-msg').textContent = '';
       document.getElementById('prof-msg').textContent = '';
       document.getElementById('ci-msg').textContent = '';

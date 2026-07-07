@@ -61,7 +61,9 @@ mod ai;
 mod bitwarden;
 mod blocker;
 mod import;
+mod safety;
 mod search;
+mod sync;
 mod store;
 mod webauthn;
 
@@ -568,6 +570,22 @@ enum UserEvent {
     HardReload,
     /// A URL handed to Aperture from outside (default-browser open or a second launch).
     OpenExternal(String),
+    /// A URL a peer device sent over the tailnet: open it and toast where it came from.
+    OpenFromPeer { url: String, from: String },
+    /// Send the active tab's URL to a peer (index into settings.sync.peers).
+    SendTabToPeer(usize),
+    /// Result of a send attempt, for a toast.
+    PeerSendResult(String),
+    /// A navigation to a known-malicious host was stopped; show the warning overlay.
+    SafetyBlocked { id: u32, url: String },
+    /// User chose to proceed past the safe-browsing warning: bypass the host and navigate.
+    SafetyContinue,
+    /// Dismiss the safe-browsing warning (stay put).
+    SafetyBack,
+    /// Update the blocklist now (Settings > Safety button).
+    SafetyUpdate,
+    /// Result of a blocklist fetch (background at launch or manual).
+    SafetyUpdated(Result<String, String>),
     /// Run the Chrome importer on a worker thread (Settings > General > Import from Chrome).
     ChromeImport { profile: String, bm: bool, hist: bool, ext: bool },
     /// Importer results, merged into live state on the main thread.
@@ -1240,6 +1258,20 @@ fn main() -> wry::Result<()> {
                 Some("set_default_browser") => {
                     let _ = proxy_ipc.send_event(UserEvent::SetDefaultBrowser);
                 }
+                Some("safety_continue") => {
+                    let _ = proxy_ipc.send_event(UserEvent::SafetyContinue);
+                }
+                Some("safety_back") => {
+                    let _ = proxy_ipc.send_event(UserEvent::SafetyBack);
+                }
+                Some("safety_update") => {
+                    let _ = proxy_ipc.send_event(UserEvent::SafetyUpdate);
+                }
+                Some("send_tab") => {
+                    if let Some(i) = v["peer"].as_u64() {
+                        let _ = proxy_ipc.send_event(UserEvent::SendTabToPeer(i as usize));
+                    }
+                }
                 Some("chrome_import") => {
                     if let Some(p) = v["profile"].as_str() {
                         let _ = proxy_ipc.send_event(UserEvent::ChromeImport {
@@ -1443,6 +1475,44 @@ fn main() -> wry::Result<()> {
     let mut history = store::load_history();
     let mut links = store::load_links();
     let mut settings = store::load_settings();
+    // Cross-device (Tailscale) send/receive. Seed a device name + token on first use, then start
+    // the tailnet listener when enabled. Sending stays available even if the listener can't bind.
+    if settings.sync.device_name.is_empty() {
+        settings.sync.device_name = hostname_label();
+    }
+    if settings.sync.token.is_empty() {
+        settings.sync.token = random_token();
+    }
+    store::save_settings(&settings);
+    // Detected once at launch, shown in Settings > Devices and used to bind the listener.
+    let my_tailscale_ip = sync::tailscale_ip();
+    // The listener binds once per session; a mid-session enable (Save) starts it if it wasn't.
+    let mut sync_listener_started = false;
+    if settings.sync.enabled {
+        if let Some(ip) = my_tailscale_ip {
+            let proxy = event_loop.create_proxy();
+            sync::spawn_listener(ip, store::SYNC_PORT, settings.sync.token.clone(), move |url| {
+                let _ = proxy.send_event(UserEvent::OpenFromPeer {
+                    url,
+                    from: String::new(),
+                });
+            });
+            sync_listener_started = true;
+        } else {
+            eprintln!("[sync] Tailscale IP not found; receiving disabled (sending still works)");
+        }
+    }
+    let my_tailscale_ip: String = my_tailscale_ip.map(|i| i.to_string()).unwrap_or_default();
+    // Local safe-browsing: load the blocklist and, if enabled and the cached feed is stale,
+    // refresh it in the background (downloads the list only, never sends the URLs you visit).
+    let _ = SAFE_BROWSING.set(safety::SafeBrowsing::load(settings.safety.enabled));
+    if settings.safety.enabled && !settings.safety.feed_url.is_empty() && safety::cache_is_stale() {
+        let feed = settings.safety.feed_url.clone();
+        let proxy = event_loop.create_proxy();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(UserEvent::SafetyUpdated(safety::fetch(&feed)));
+        });
+    }
     // Browsing trail (the new-tab navigation graph); prune to the retention window at launch.
     let mut trail = store::load_trail();
     store::prune_trail(&mut trail, settings.trail.retention_days);
@@ -1459,6 +1529,8 @@ fn main() -> wry::Result<()> {
     let mut pending_save: Option<PendingSave> = None;
     let mut dismissed_save_hosts: HashSet<String> = HashSet::new();
     let mut pending_webauthn: Option<PendingWebauthn> = None;
+    // A navigation stopped by safe-browsing, awaiting the user's decision (tab id + blocked URL).
+    let mut pending_safety: Option<(u32, String)> = None;
     // AI: monotonic request id (lets late tokens from a superseded/stopped request be dropped) and a
     // shared cancel flag the worker thread polls.
     let mut ai_req: u64 = 0;
@@ -2667,6 +2739,46 @@ fn main() -> wry::Result<()> {
                     window.set_focus();
                     let _ = spawn_proxy.send_event(UserEvent::NewTabUrl(url, None));
                 }
+                UserEvent::OpenFromPeer { url, from } => {
+                    window.set_minimized(false);
+                    window.set_focus();
+                    let _ = spawn_proxy.send_event(UserEvent::NewTabUrl(url, None));
+                    let who = if from.is_empty() { "another device" } else { &from };
+                    let _ = chrome.evaluate_script(&format!(
+                        "window.__chrome&&window.__chrome.toast({})",
+                        serde_json::to_string(&format!("Opened a tab sent from {who}")).unwrap()
+                    ));
+                }
+                UserEvent::SendTabToPeer(idx) => {
+                    let url = active_url(&tabs, active);
+                    let peer = settings.sync.peers.get(idx).cloned();
+                    match peer {
+                        Some(p) if url.starts_with("http") => {
+                            let token = settings.sync.token.clone();
+                            let me = settings.sync.device_name.clone();
+                            let proxy = spawn_proxy.clone();
+                            std::thread::spawn(move || {
+                                let msg = match sync::send_open(&p.address, store::SYNC_PORT, &token, &url, &me) {
+                                    Ok(()) => format!("Sent to {}", p.name),
+                                    Err(e) => format!("Couldn't send to {}: {e}", p.name),
+                                };
+                                let _ = proxy.send_event(UserEvent::PeerSendResult(msg));
+                            });
+                        }
+                        Some(_) => {
+                            let _ = chrome.evaluate_script(
+                                "window.__chrome&&window.__chrome.toast(\"Nothing to send from this tab\")",
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                UserEvent::PeerSendResult(msg) => {
+                    let _ = chrome.evaluate_script(&format!(
+                        "window.__chrome&&window.__chrome.toast({})",
+                        serde_json::to_string(&msg).unwrap()
+                    ));
+                }
                 UserEvent::SetDefaultBrowser => {
                     let ok = register_as_default_browser();
                     if ok {
@@ -2679,6 +2791,67 @@ fn main() -> wry::Result<()> {
                         "window.__chrome&&window.__chrome.defaultBrowserMsg({ok})"
                     ));
                 }
+                UserEvent::SafetyBlocked { id, url } => {
+                    pending_safety = Some((id, url.clone()));
+                    enter_safety_modal(&window, &chrome, &ai_sidebar, &tabs, active, &url);
+                }
+                UserEvent::SafetyContinue => {
+                    if let Some((id, url)) = pending_safety.take() {
+                        if let Some(sb) = SAFE_BROWSING.get() {
+                            sb.bypass_host(&host_of(&url));
+                        }
+                        exit_safety_modal(&window, &chrome, &ai_sidebar, &mut tabs, active);
+                        if let Some(t) = tabs.iter_mut().find(|t| t.id == id) {
+                            ensure_live(t, &window, spawn_proxy.clone(), &engine, &mut web_context);
+                            if let Some(wv) = &t.webview {
+                                let _ = wv.load_url(&url);
+                            }
+                        }
+                    }
+                }
+                UserEvent::SafetyBack => {
+                    pending_safety = None;
+                    exit_safety_modal(&window, &chrome, &ai_sidebar, &mut tabs, active);
+                }
+                UserEvent::SafetyUpdate => {
+                    if settings.safety.feed_url.is_empty() {
+                        let _ = chrome.evaluate_script(
+                            "window.__chrome&&window.__chrome.safetyMsg(\"No feed URL set.\")",
+                        );
+                    } else {
+                        let _ = chrome.evaluate_script(
+                            "window.__chrome&&window.__chrome.safetyMsg(\"Updating…\")",
+                        );
+                        let feed = settings.safety.feed_url.clone();
+                        let proxy = spawn_proxy.clone();
+                        std::thread::spawn(move || {
+                            let _ = proxy.send_event(UserEvent::SafetyUpdated(safety::fetch(&feed)));
+                        });
+                    }
+                }
+                UserEvent::SafetyUpdated(res) => match res {
+                    Ok(text) => {
+                        if let Some(sb) = SAFE_BROWSING.get() {
+                            sb.replace(&text);
+                            settings.safety.last_updated = store::unix_now();
+                            store::save_settings(&settings);
+                            let _ = chrome.evaluate_script(&format!(
+                                "window.__chrome&&window.__chrome.safetyMsg({})",
+                                serde_json::to_string(&format!(
+                                    "Updated: {} sites on the blocklist.",
+                                    sb.count()
+                                ))
+                                .unwrap()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = chrome.evaluate_script(&format!(
+                            "window.__chrome&&window.__chrome.safetyMsg({})",
+                            serde_json::to_string(&format!("Update failed: {e}")).unwrap()
+                        ));
+                    }
+                },
                 UserEvent::ChromeImport { profile, bm, hist, ext } => {
                     match import::profile_dir(&profile) {
                         Some(dir) => {
@@ -3281,6 +3454,7 @@ fn main() -> wry::Result<()> {
 
                 UserEvent::ChromeReady => {
                     push_profiles(&chrome, &profiles, &current_profile);
+                    push_sync(&chrome, &settings, &my_tailscale_ip);
                     // Optional launch picker: only when the user turned it on, more than one
                     // profile exists, and this launch wasn't already told what to open.
                     if profiles.ask_at_startup
@@ -3898,8 +4072,39 @@ fn main() -> wry::Result<()> {
                         let folders = std::mem::take(&mut settings.bookmark_folders);
                         settings = parsed;
                         settings.bookmark_folders = folders;
+                        // Device name/token are seeded once and must never be blanked by a save.
+                        if settings.sync.device_name.trim().is_empty() {
+                            settings.sync.device_name = hostname_label();
+                        }
+                        if settings.sync.token.trim().is_empty() {
+                            settings.sync.token = random_token();
+                        }
                         store::save_settings(&settings);
                         rebuild_shortcut_map(&settings.shortcuts);
+                        // Start the tailnet listener if the user just turned sync on this session.
+                        if settings.sync.enabled && !sync_listener_started {
+                            if let Some(ip) = sync::tailscale_ip() {
+                                let proxy = spawn_proxy.clone();
+                                sync::spawn_listener(ip, store::SYNC_PORT, settings.sync.token.clone(), move |url| {
+                                    let _ = proxy.send_event(UserEvent::OpenFromPeer { url, from: String::new() });
+                                });
+                                sync_listener_started = true;
+                            }
+                        }
+                        push_sync(&chrome, &settings, &my_tailscale_ip);
+                        // Apply safe-browsing toggle live; a newly-set feed refreshes now.
+                        if let Some(sb) = SAFE_BROWSING.get() {
+                            sb.set_enabled(settings.safety.enabled);
+                        }
+                        if settings.safety.enabled && !settings.safety.feed_url.is_empty()
+                            && safety::cache_is_stale()
+                        {
+                            let feed = settings.safety.feed_url.clone();
+                            let proxy = spawn_proxy.clone();
+                            std::thread::spawn(move || {
+                                let _ = proxy.send_event(UserEvent::SafetyUpdated(safety::fetch(&feed)));
+                            });
+                        }
                     }
                     // Tab orientation feeds the layout helpers; update it before the modal exits so the
                     // chrome shrinks back to the correct strip/column and content reflows in one pass.
@@ -4248,6 +4453,15 @@ fn build_content_webview(
             }
         })
         .with_navigation_handler(move |u| {
+            // Safe-browsing gate: stop navigations to known-malicious hosts and show the warning
+            // overlay instead. Cancelling here leaves the tab on its previous page.
+            if let Some(sb) = SAFE_BROWSING.get() {
+                let host = host_of(&u);
+                if !host.is_empty() && sb.is_blocked(&host) {
+                    let _ = proxy.send_event(UserEvent::SafetyBlocked { id, url: u });
+                    return false;
+                }
+            }
             let _ = proxy.send_event(UserEvent::PageUrlChanged(id, u));
             true
         })
@@ -5545,6 +5759,32 @@ fn exit_save_modal(window: &Window, chrome: &WebView, ai: &WebView, tabs: &mut [
     let _ = ai.set_visible(AI_PANEL_W.load(Ordering::Relaxed) > 0);
 }
 
+/// Grow the chrome to fill the window and show the safe-browsing warning for a blocked URL.
+fn enter_safety_modal(window: &Window, chrome: &WebView, ai: &WebView, tabs: &[Tab], active: u32, url: &str) {
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    if let Some(t) = tabs.iter().find(|t| t.id == active) {
+        if let Some(wv) = &t.webview {
+            let _ = wv.set_visible(false);
+        }
+    }
+    let _ = ai.set_visible(false);
+    let _ = chrome.set_bounds(Rect {
+        position: LogicalPosition::new(0.0, 0.0).into(),
+        size: LogicalSize::new(size.width, size.height).into(),
+    });
+    if let Ok(js) = serde_json::to_string(url) {
+        let _ = chrome.evaluate_script(&format!("window.__chrome&&window.__chrome.showSafety({js})"));
+    }
+}
+
+fn exit_safety_modal(window: &Window, chrome: &WebView, ai: &WebView, tabs: &mut [Tab], active: u32) {
+    let _ = chrome.evaluate_script("window.__chrome&&window.__chrome.hideSafety()");
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let _ = chrome.set_bounds(chrome_rect(size.width, size.height));
+    activate(window, tabs, active);
+    let _ = ai.set_visible(AI_PANEL_W.load(Ordering::Relaxed) > 0);
+}
+
 /// Grow the chrome to fill the window and show the command palette (Ctrl+K).
 fn enter_palette_modal(window: &Window, chrome: &WebView, ai: &WebView, tabs: &[Tab], active: u32) {
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
@@ -6068,6 +6308,27 @@ fn push_tabs(chrome: &WebView, tabs: &[Tab], active: u32) {
     }
 }
 
+/// Push cross-device config to the chrome: this device's name + tailnet address, the peer list,
+/// and whether sync is on (drives the tab "Send to device" menu and Settings > Devices).
+fn push_sync(chrome: &WebView, settings: &store::Settings, my_ip: &str) {
+    let peers: Vec<serde_json::Value> = settings
+        .sync
+        .peers
+        .iter()
+        .map(|p| serde_json::json!({ "name": p.name, "address": p.address }))
+        .collect();
+    let payload = serde_json::json!({
+        "enabled": settings.sync.enabled,
+        "device_name": settings.sync.device_name,
+        "token": settings.sync.token,
+        "address": my_ip,
+        "peers": peers,
+    });
+    if let Ok(js) = serde_json::to_string(&payload) {
+        let _ = chrome.evaluate_script(&format!("window.__chrome&&window.__chrome.setSync({js})"));
+    }
+}
+
 /// Push the profile registry to the chrome (Settings > Profiles + the startup picker).
 fn push_profiles(chrome: &WebView, profiles: &store::ProfilesFile, current: &str) {
     let mut names = vec!["Default".to_string()];
@@ -6574,6 +6835,42 @@ const OPEN_URL_PIPE: &str = r"\\.\pipe\aperture_open_url";
 
 /// " [<profile>]" window-title suffix for non-default profiles (empty for Default).
 static PROFILE_SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Process-global safe-browsing set, consulted by every tab's navigation handler. Global (rather
+/// than threaded through make_tab's many call sites) because it's a cheap shared lookup.
+static SAFE_BROWSING: std::sync::OnceLock<safety::SafeBrowsing> = std::sync::OnceLock::new();
+
+/// This machine's name, for the default sync device label. Falls back to "This PC".
+fn hostname_label() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "This PC".to_string())
+}
+
+/// A URL-safe random token for the sync shared secret. No crypto crate needed: mixes a few OS
+/// entropy sources (pid, addresses, high-res time) through a splitmix64 into hex. This gates a
+/// tailnet-only listener, not a public secret, so it just needs to be unguessable per install.
+fn random_token() -> String {
+    let mut seed = std::process::id() as u64;
+    seed ^= std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    seed ^= (&seed as *const u64 as u64).rotate_left(17);
+    let mut out = String::new();
+    let mut x = seed | 1;
+    for _ in 0..4 {
+        // splitmix64
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out.push_str(&format!("{z:016x}"));
+    }
+    out
+}
 
 /// Split the command line into (--profile value, first non-flag argument).
 fn parse_args() -> (Option<String>, Option<String>) {

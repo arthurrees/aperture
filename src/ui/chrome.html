@@ -718,6 +718,7 @@
         <span class="hist-title">History</span>
         <div class="hist-tabs">
           <button id="histmh" class="on">History</button>
+          <button id="histmc" title="Groups of tabs closed together (windows, groups, workspaces)">Recently closed</button>
           <button id="histma" title="Tabs the auto-archiver closed">Archived</button>
         </div>
         <input id="histq" type="text" autocomplete="off" spellcheck="false" placeholder="Search history…" />
@@ -2442,15 +2443,45 @@
 
   // History viewer (Ctrl+H): full-window overlay with search + delete, seeded by the host.
   // Two sources behind one list: browsing history, and tabs the auto-archiver closed.
-  let lastHistory = [], lastArchive = [], histMode = 'h';
+  let lastHistory = [], lastArchive = [], lastClosed = [], histMode = 'h';
   const histPanel = document.getElementById('history');
   const histq = document.getElementById('histq');
   const histlist = document.getElementById('histlist');
+  function timeAgo(ts) {
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (s < 90) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return new Date(ts * 1000).toLocaleDateString();
+  }
   function renderHistory() {
+    histlist.innerHTML = '';
+    // "Recently closed" is a list of batches (each reopens as a unit), not single pages.
+    if (histMode === 'c') {
+      const f = histq.value.trim().toLowerCase();
+      const groups = lastClosed.filter(g => !f || (g.label || '').toLowerCase().includes(f));
+      if (!groups.length) {
+        const e = document.createElement('div'); e.className = 'hist-empty';
+        e.textContent = lastClosed.length ? 'No matching closed groups.' : 'Nothing closed yet.';
+        histlist.appendChild(e); return;
+      }
+      groups.forEach(g => {
+        const row = document.createElement('div'); row.className = 'hist-item';
+        const meta = document.createElement('div'); meta.className = 'meta';
+        const t = document.createElement('div'); t.className = 'ht';
+        t.textContent = (g.label || 'Closed') + ' · ' + g.count + (g.count === 1 ? ' tab' : ' tabs');
+        const u = document.createElement('div'); u.className = 'hu';
+        u.textContent = 'closed ' + timeAgo(g.ts) + ' · click to reopen all';
+        meta.appendChild(t); meta.appendChild(u);
+        row.appendChild(meta);
+        row.onclick = () => { send({ cmd: 'reopen_closed_group', i: g.i }); closeHistoryAnimated(); };
+        histlist.appendChild(row);
+      });
+      return;
+    }
     const f = histq.value.trim().toLowerCase();
     const src = histMode === 'a' ? lastArchive : lastHistory;
     const items = src.filter(h => !f || (h.title || '').toLowerCase().includes(f) || (h.url || '').toLowerCase().includes(f));
-    histlist.innerHTML = '';
     if (!items.length) {
       const e = document.createElement('div'); e.className = 'hist-empty';
       e.textContent = histMode === 'a'
@@ -2478,12 +2509,14 @@
   function histSetMode(m) {
     histMode = m;
     document.getElementById('histmh').classList.toggle('on', m === 'h');
+    document.getElementById('histmc').classList.toggle('on', m === 'c');
     document.getElementById('histma').classList.toggle('on', m === 'a');
-    histq.placeholder = m === 'a' ? 'Search archived tabs…' : 'Search history…';
-    document.getElementById('histclear').title = m === 'a' ? 'Clear the archive' : 'Clear all history';
+    histq.placeholder = m === 'a' ? 'Search archived tabs…' : m === 'c' ? 'Search closed groups…' : 'Search history…';
+    document.getElementById('histclear').title = m === 'a' ? 'Clear the archive' : m === 'c' ? 'Clear recently closed' : 'Clear all history';
     renderHistory();
   }
   document.getElementById('histmh').onclick = () => histSetMode('h');
+  document.getElementById('histmc').onclick = () => histSetMode('c');
   document.getElementById('histma').onclick = () => histSetMode('a');
   histq.addEventListener('input', renderHistory);
   // Close = fade out first, then tell the host to shrink the chrome (close_history). Every close
@@ -2498,7 +2531,7 @@
   }
   histq.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHistoryAnimated(); });
   document.getElementById('histclose').onclick = () => closeHistoryAnimated();
-  document.getElementById('histclear').onclick = () => send({ cmd: histMode === 'a' ? 'archive_clear' : 'history_clear' });
+  document.getElementById('histclear').onclick = () => send({ cmd: histMode === 'a' ? 'archive_clear' : histMode === 'c' ? 'closed_groups_clear' : 'history_clear' });
 
   window.__chrome = {
     setUrl(url)           { currentUrl = url; if (document.activeElement !== addr) addr.value = url; },
@@ -2532,6 +2565,7 @@
     },
     showHistory(list)     { lastHistory = list || []; renderHistory(); },
     setArchive(list)      { lastArchive = list || []; if (histMode === 'a') renderHistory(); },
+    setClosedGroups(list) { lastClosed = list || []; if (histMode === 'c') renderHistory(); },
     setProfiles(list, current, ask) { profList = list || ['Default']; profCurrent = current || 'Default'; profAsk = !!ask; renderProfiles(); },
     setChromeProfiles(list) { chromeProfiles = list || []; renderChromeProfiles(); },
     importMsg(m)          { document.getElementById('ci-msg').textContent = m; },
@@ -2559,9 +2593,20 @@
     openHistory()         { histClosing = false; histPanel.classList.remove('closing'); histPanel.classList.add('show'); histq.value = ''; renderHistory(); setTimeout(() => histq.focus(), 40); },
     closeHistory()        { histClosing = false; histPanel.classList.remove('show', 'closing'); },
     closeHistoryAnimated() { closeHistoryAnimated(); },
-    // No-op when the bar already has focus: the host re-asserts focus shortly after a new-tab page
-    // loads (the page load can steal it back), and a blind re-select would wipe in-progress typing.
-    focusOmnibox()        { if (document.activeElement === addr) return; addr.focus(); addr.select(); },
+    // Select-all only for the "replace the current URL" case (the bar is showing the committed
+    // page URL, e.g. Ctrl+L). A late new-tab re-assert fires while you've already started typing
+    // and the page briefly stole focus: there the bar holds your text (!= currentUrl), so we just
+    // land the cursor at the end instead of selecting, which used to wipe the first keystrokes.
+    focusOmnibox() {
+      const wasFocused = document.activeElement === addr;
+      addr.focus();
+      if (addr.value && addr.value === currentUrl) {
+        addr.select();
+      } else if (!wasFocused) {
+        const n = addr.value.length;
+        addr.setSelectionRange(n, n);
+      }
+    },
     toggleFind()          { if (findbar.classList.contains('show')) { closeFind(); } else { findbar.classList.add('show'); setTimeout(() => { findq.select(); findq.focus(); }, 30); } },
     showPalette()         { palq.value = ''; palItems = palBuild(''); palSel = 0; palRender(); palette.classList.add('show'); setTimeout(() => palq.focus(), 40); },
     hidePalette()         { palette.classList.remove('show'); },

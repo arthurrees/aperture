@@ -755,6 +755,55 @@ pub fn record_archive(archive: &mut Vec<ArchivedTab>, url: &str, title: &str) {
     archive.truncate(ARCHIVE_CAP);
 }
 
+const CLOSED_GROUPS_CAP: usize = 25;
+
+/// One tab within a closed group.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ClosedTab {
+    pub url: String,
+    pub title: String,
+}
+
+/// A set of tabs that were closed together (a window close, a profile switch, a closed tab group,
+/// or a deleted workspace), so the whole batch can be reopened as a unit from the History viewer.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ClosedGroup {
+    /// Unix seconds when the batch closed.
+    pub ts: u64,
+    /// What was closed ("Window", a group/workspace name, ...).
+    pub label: String,
+    pub tabs: Vec<ClosedTab>,
+}
+
+pub fn load_closed_groups() -> Vec<ClosedGroup> {
+    fs::read_to_string(data_dir().join("closed_groups.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_closed_groups(groups: &[ClosedGroup]) {
+    if let Ok(s) = serde_json::to_string(groups) {
+        let _ = fs::write(data_dir().join("closed_groups.json"), s);
+    }
+}
+
+/// Record a batch of closed tabs (newest first, capped). Ignores empty batches.
+pub fn record_closed_group(groups: &mut Vec<ClosedGroup>, label: &str, tabs: Vec<ClosedTab>) {
+    if tabs.is_empty() {
+        return;
+    }
+    groups.insert(
+        0,
+        ClosedGroup {
+            ts: unix_now(),
+            label: label.to_string(),
+            tabs,
+        },
+    );
+    groups.truncate(CLOSED_GROUPS_CAP);
+}
+
 const TRAIL_CAP: usize = 4000;
 
 /// One node-visit on the browsing trail (feeds the new-tab navigation graph). Unlike history

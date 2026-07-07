@@ -544,6 +544,10 @@ enum UserEvent {
     FindResult(String),
     /// Restore tabs from the most recent full-window close.
     RestoreClosedWindow,
+    /// Reopen a whole batch of simultaneously-closed tabs by index (History > Closed).
+    ReopenClosedGroup(usize),
+    /// Clear the recently-closed-groups list.
+    ClearClosedGroups,
     /// Command palette (Ctrl+K): open/close the jump-to overlay.
     OpenPalette,
     ClosePalette,
@@ -1076,6 +1080,14 @@ fn main() -> wry::Result<()> {
                 Some("restore_closed") => {
                     let _ = proxy_ipc.send_event(UserEvent::RestoreClosedWindow);
                 }
+                Some("reopen_closed_group") => {
+                    if let Some(i) = v["i"].as_u64() {
+                        let _ = proxy_ipc.send_event(UserEvent::ReopenClosedGroup(i as usize));
+                    }
+                }
+                Some("closed_groups_clear") => {
+                    let _ = proxy_ipc.send_event(UserEvent::ClearClosedGroups);
+                }
                 Some("bw_fill") => {
                     let _ = proxy_ipc.send_event(UserEvent::BwFill);
                 }
@@ -1549,6 +1561,9 @@ fn main() -> wry::Result<()> {
     let mut history_open = false;
     // URLs of recently closed tabs, for Ctrl+Shift+T (most-recent on top).
     let mut closed_stack: Vec<String> = Vec::new();
+    // Batches of tabs closed together (window close, profile switch, closed group/workspace),
+    // reopenable as a unit from History > Closed. Persists across restarts.
+    let mut closed_groups = store::load_closed_groups();
     // Downloads shown in the toolbar popover (most-recent on top), this session only.
     let mut downloads: Vec<DownloadItem> = Vec::new();
     // Per-site zoom factors (host -> factor), remembered across navigations and restarts.
@@ -2652,6 +2667,33 @@ fn main() -> wry::Result<()> {
                         persist_session(&tabs, active);
                     }
                 }
+                UserEvent::ReopenClosedGroup(i) => {
+                    // Reopen every tab from a closed batch into the current workspace, then drop
+                    // the batch from the list (like reopening it consumes it).
+                    if i < closed_groups.len() {
+                        let group = closed_groups.remove(i);
+                        store::save_closed_groups(&closed_groups);
+                        for ct in &group.tabs {
+                            let mut t = make_tab(&window, next_id, &ct.url, spawn_proxy.clone(), &engine, &mut web_context, false);
+                            t.workspace = active_ws;
+                            active = t.id;
+                            tabs.push(t);
+                            next_id += 1;
+                        }
+                        relayout(&window, &chrome, &ai_sidebar, &tabs);
+                        activate(&window, &mut tabs, active);
+                        push_tabs(&chrome, &tabs, active);
+                        push_url_star(&chrome, &tabs, active, &bookmarks);
+                        push_can_go(&chrome, &tabs, active);
+                        push_closed_groups(&chrome, &closed_groups);
+                        persist_session(&tabs, active);
+                    }
+                }
+                UserEvent::ClearClosedGroups => {
+                    closed_groups.clear();
+                    store::save_closed_groups(&closed_groups);
+                    push_closed_groups(&chrome, &closed_groups);
+                }
                 UserEvent::OpenPalette => {
                     enter_palette_modal(&window, &chrome, &ai_sidebar, &tabs, active);
                 }
@@ -2948,6 +2990,8 @@ fn main() -> wry::Result<()> {
                         // restore prompt), point the registry at the target, free our mutex so
                         // the successor can start, and hand off.
                         save_closed_window_session(&tabs, active);
+                        store::record_closed_group(&mut closed_groups, "Window", snapshot_closed_tabs(tabs.iter()));
+                        store::save_closed_groups(&closed_groups);
                         store::clear_session();
                         profiles.last = name.clone();
                         store::save_profiles(&profiles);
@@ -3057,6 +3101,20 @@ fn main() -> wry::Result<()> {
                 }
                 UserEvent::DeleteWorkspace(ws) => {
                     if ws != 0 && workspaces.iter().any(|w| w.id == ws) {
+                        // Record the workspace's tabs as a reopenable batch (History > Closed),
+                        // and each also lands on the Ctrl+Shift+T stack.
+                        let label = workspaces
+                            .iter()
+                            .find(|w| w.id == ws)
+                            .map(|w| if w.name.is_empty() { "Workspace".to_string() } else { w.name.clone() })
+                            .unwrap_or_else(|| "Workspace".to_string());
+                        store::record_closed_group(
+                            &mut closed_groups,
+                            &label,
+                            snapshot_closed_tabs(tabs.iter().filter(|t| t.workspace == ws)),
+                        );
+                        store::save_closed_groups(&closed_groups);
+                        push_closed_groups(&chrome, &closed_groups);
                         // Close the workspace's tabs; each lands on the reopen stack so this is
                         // recoverable with Ctrl+Shift+T.
                         let doomed: Vec<u32> = tabs
@@ -3375,6 +3433,19 @@ fn main() -> wry::Result<()> {
                     persist_session(&tabs, active);
                 }
                 UserEvent::CloseGroup(group) => {
+                    // Record the group as a reopenable batch (History > Closed) before removing it.
+                    let label = groups
+                        .iter()
+                        .find(|g| g.id == group)
+                        .map(|g| if g.name.is_empty() { "Tab group".to_string() } else { g.name.clone() })
+                        .unwrap_or_else(|| "Tab group".to_string());
+                    store::record_closed_group(
+                        &mut closed_groups,
+                        &label,
+                        snapshot_closed_tabs(tabs.iter().filter(|t| t.group == Some(group))),
+                    );
+                    store::save_closed_groups(&closed_groups);
+                    push_closed_groups(&chrome, &closed_groups);
                     let ids: Vec<u32> =
                         tabs.iter().filter(|t| t.group == Some(group)).map(|t| t.id).collect();
                     for id in &ids {
@@ -3477,6 +3548,7 @@ fn main() -> wry::Result<()> {
                     push_history_source(&chrome, &history);
                     push_restore_prompt(&chrome);
                     push_archive(&chrome, &archive);
+                    push_closed_groups(&chrome, &closed_groups);
                     push_chrome_ai_cfg(&chrome, &settings);
                     push_tab_layout(&chrome, settings.vertical_tabs);
                     let _ = chrome.evaluate_script(&chrome_theme_js(&settings.theme));
@@ -4285,6 +4357,9 @@ fn main() -> wry::Result<()> {
                 ..
             } => {
                 save_closed_window_session(&tabs, active);
+                // Also record the whole window as a reopenable batch in History > Closed.
+                store::record_closed_group(&mut closed_groups, "Window", snapshot_closed_tabs(tabs.iter()));
+                store::save_closed_groups(&closed_groups);
                 store::clear_session();
                 *control_flow = ControlFlow::Exit;
             }
@@ -6617,6 +6692,33 @@ fn session_from_tabs(tabs: &[Tab], active: u32) -> store::Session {
 
 fn persist_session(tabs: &[Tab], active: u32) {
     store::save_session(&session_from_tabs(tabs, active));
+}
+
+/// Snapshot real tabs into closed-group entries (strip order). Skips private, ephemeral, and the
+/// blank new-tab page (reopening a home tab is just noise).
+fn snapshot_closed_tabs<'a>(iter: impl Iterator<Item = &'a Tab>) -> Vec<store::ClosedTab> {
+    iter.filter(|t| !t.private && !is_ephemeral_tab(&t.url) && !t.url.contains("home.html"))
+        .map(|t| store::ClosedTab {
+            url: t.url.clone(),
+            title: t.title.clone(),
+        })
+        .collect()
+}
+
+/// Push the recently-closed-groups list to the History viewer (index, label, count, timestamp).
+fn push_closed_groups(chrome: &WebView, groups: &[store::ClosedGroup]) {
+    let arr: Vec<serde_json::Value> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            serde_json::json!({ "i": i, "label": g.label, "count": g.tabs.len(), "ts": g.ts })
+        })
+        .collect();
+    if let Ok(js) = serde_json::to_string(&serde_json::Value::Array(arr)) {
+        let _ = chrome.evaluate_script(&format!(
+            "window.__chrome&&window.__chrome.setClosedGroups({js})"
+        ));
+    }
 }
 
 fn save_closed_window_session(tabs: &[Tab], active: u32) {
